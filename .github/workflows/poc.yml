@@ -1,0 +1,117 @@
+name: firmware-exec-poc
+# AXIS OS PoC harness: downloads official Axis firmware (SHA256-verified), extracts the
+# squashfs rootfs, and executes target aarch64 binaries under qemu-user-static inside a
+# chroot. Output = verbatim execution log (executed-proof artifact for bug bounty reports).
+on:
+  workflow_dispatch:
+    inputs:
+      firmware_url:
+        description: "Official ftp.axis.com .bin URL"
+        required: true
+      firmware_sha256:
+        description: "Expected SHA256 of the .bin"
+        required: true
+      run_cmd:
+        description: "Command to execute inside the extracted rootfs (chroot)"
+        required: true
+        default: "/usr/html/axis-cgi/basicdeviceinfo.cgi"
+
+jobs:
+  poc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Install tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-user-static zstd python3-pip
+          python3 -m pip install --quiet PySquashfsImage zstandard
+
+      - name: Download and verify official firmware
+        run: |
+          cd /tmp
+          curl -sS -o fw.bin "${{ github.event.inputs.firmware_url }}"
+          echo "${{ github.event.inputs.firmware_sha256 }}  fw.bin" | sha256sum -c -
+          ls -la fw.bin
+
+      - name: Unpack firmware
+        run: |
+          cd /tmp
+          python3 - <<'EOF'
+          import gzip, tarfile, io, sys
+          src = 'fw.bin'
+          magic = open(src,'rb').read(4)
+          if magic[:2] == b'\x1f\x8b':
+              raw = gzip.open(src,'rb').read()
+          elif magic == b'\x28\xb5\x2f\xfd':
+              import zstandard
+              raw = zstandard.ZstdDecompressor().stream_reader(open(src,'rb')).read()
+          else:
+              sys.exit('unknown container magic %r' % magic)
+          open('fw.tar','wb').write(raw)
+          tf = tarfile.open('fw.tar')
+          names = [m.name for m in tf.getmembers()]
+          print('members:', names)
+          tf.extractall('pkg')
+          print('extracted pkg/')
+          EOF
+
+      - name: Extract rootfs
+        run: |
+          cd /tmp
+          python3 - <<'EOF'
+          from PySquashfsImage import SquashFsImage
+          import os, stat
+          img = SquashFsImage(open('pkg/rootfs.img','rb'))
+          def sanitize(n):
+              for c in '\\/:*?"<>|':
+                  n = n.replace(c,'_')
+              return n
+          def walk(node, outdir):
+              name = node.name
+              if isinstance(name, bytes): name = name.decode('utf-8','replace')
+              path = os.path.join(outdir, sanitize(name))
+              if node.is_dir:
+                  os.makedirs(path, exist_ok=True)
+                  for ch in node.iterdir():
+                      try: walk(ch, path)
+                      except Exception as e: print('walk fail', path, e)
+                  return
+              try:
+                  data = img.read_file(node.inode)
+              except Exception as e:
+                  print('read fail', path, e); return
+              if node.is_symlink:
+                  open(path + '.symlink','w').write((data or b'').decode('utf-8','replace')); return
+              if data is None:
+                  open(path + '.unreadable','wb').close(); return
+              open(path,'wb').write(data)
+              try: os.chmod(path, node.mode & 0o777)
+              except OSError: pass
+          os.makedirs('rootfs', exist_ok=True)
+          for ch in img.root.iterdir():
+              walk(ch, 'rootfs')
+          print('rootfs extracted')
+          EOF
+          sudo mv /tmp/rootfs /opt/rootfs
+          ls /opt/rootfs | head
+
+      - name: Execute PoC command under qemu-user chroot
+        run: |
+          # copy qemu interpreter into the rootfs for binfmt-free explicit invocation
+          sudo cp /usr/bin/qemu-aarch64-static /opt/rootfs/usr/bin/ 2>/dev/null || true
+          sudo mount --bind /proc /opt/rootfs/proc 2>/dev/null || sudo mount -t proc proc /opt/rootfs/proc
+          echo "=== POC COMMAND ==="
+          echo "${{ github.event.inputs.run_cmd }}"
+          echo "=== EXECUTION OUTPUT (verbatim) ==="
+          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static ${{ github.event.inputs.run_cmd }} 2>&1 | tee /tmp/poc.log
+          echo "=== EXIT: $? ==="
+          echo "=== END EXECUTION OUTPUT ==="
+
+      - name: Archive execution log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: poc-execution-log
+          path: /tmp/poc.log
+          if-no-files-found: warn
