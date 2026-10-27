@@ -82,7 +82,13 @@ jobs:
               except Exception as e:
                   print('read fail', path, e); return
               if node.is_symlink:
-                  open(path + '.symlink','w').write((data or b'').decode('utf-8','replace')); return
+                  target = (data or b'').decode('utf-8','replace')
+                  try:
+                      if os.path.lexists(path): os.remove(path)
+                      os.symlink(target, path)
+                  except OSError:
+                      open(path + '.symlink','w').write(target)
+                  return
               if data is None:
                   open(path + '.unreadable','wb').close(); return
               open(path,'wb').write(data)
