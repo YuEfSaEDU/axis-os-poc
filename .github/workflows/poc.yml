@@ -104,7 +104,7 @@ jobs:
           echo "=== POC COMMAND ==="
           echo "${{ github.event.inputs.run_cmd }}"
           echo "=== EXECUTION OUTPUT (verbatim) ==="
-          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static ${{ github.event.inputs.run_cmd }} 2>&1 | tee /tmp/poc.log
+          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /bin/sh -c "${{ github.event.inputs.run_cmd }}" 2>&1 | tee /tmp/poc.log
           echo "=== EXIT: $? ==="
           echo "=== END EXECUTION OUTPUT ==="
 
