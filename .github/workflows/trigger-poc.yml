@@ -183,22 +183,33 @@ jobs:
           timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionConfiguration List 2>&1 | tee /tmp/conflist.log | head -c 1500
           echo ""
           echo "=== STEP 3: build start_event XML variants and try ActionRule.Add ==="
-          sudo tee /opt/rootfs/tmp/start_event.xml > /dev/null <<'XML'
-          <?xml version="1.0" encoding="UTF-8"?><wsnt:TopicExpression xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" xmlns:tns1="http://www.onvif.org/ver10/topics" xmlns:tnsaxis="http://www.axis.com/2009/event/topics" Dialect="http://docs.oasis-open.org/wsn/t-1/TopicExpression/Concrete">tns1:Device/tnsaxis:IO/tnsaxis:VirtualInput</wsnt:TopicExpression>
+          # V1: engine-NATIVE keyvalue property XML (format of shipped static rules,
+          #     mirrors /usr/share/event/declarations.d/com.axis.Event.VirtualInput.xml)
+          sudo tee /opt/rootfs/tmp/start_event_P.xml > /dev/null <<'XML'
+          <?xml version="1.0" encoding="UTF-8"?><property><expression><keyvalue key="topic0" value-type="string" value="Device" name-space="tns1"/><keyvalue key="topic1" value-type="string" value="IO" name-space="tnsaxis"/><keyvalue key="topic2" value-type="string" value="VirtualInput" name-space="tnsaxis"/><keyvalue key="port" value-type="int" value="1"><tag tag="onvif-source"/></keyvalue><keyvalue key="active" value-type="bool" value="1"><tag tag="onvif-data"/><tag tag="property-state"/></keyvalue></expression></property>
           XML
-          sudo tee /opt/rootfs/tmp/start_event_wrap.xml > /dev/null <<'XML'
+          # V2: VAPIX-style StartEvent wrapper with WSN TopicExpression
+          sudo tee /opt/rootfs/tmp/start_event_W.xml > /dev/null <<'XML'
           <?xml version="1.0" encoding="UTF-8"?><StartEvent><wsnt:TopicExpression xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" xmlns:tns1="http://www.onvif.org/ver10/topics" xmlns:tnsaxis="http://www.axis.com/2009/event/topics" Dialect="http://docs.oasis-open.org/wsn/t-1/TopicExpression/Concrete">tns1:Device/tnsaxis:IO/tnsaxis:VirtualInput</wsnt:TopicExpression></StartEvent>
           XML
-          sudo tee /opt/rootfs/tmp/start_event_wrap_mc.xml > /dev/null <<'XML'
+          # V3: wrapper + MessageContent matching SendEvent custom pulse
+          sudo tee /opt/rootfs/tmp/start_event_M.xml > /dev/null <<'XML'
           <?xml version="1.0" encoding="UTF-8"?><StartEvent><wsnt:TopicExpression xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" xmlns:tnsaxis="http://www.axis.com/2009/event/topics" Dialect="http://docs.oasis-open.org/wsn/t-1/TopicExpression/Concrete">tnsaxis:SendEvent</wsnt:TopicExpression><wsnt:MessageContent xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" Dialect="http://www.onvif.org/ver10/tev/messageContentFilter/ItemFilter">boolean(//SimpleItem[@Name="poc" and @Value="1"])</wsnt:MessageContent></StartEvent>
           XML
           if [ -z "${CONF_ID}" ]; then CONF_ID=12; fi
-          for VAR in A B D; do
+          AE_START="sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/actionengined -ni actionengined.system -c /usr/share/actionengine/action_engine_system.conf > /tmp/ae.log 2>&1 &"
+          for VAR in P W M; do
             case $VAR in
-              A) XF=start_event.xml;;
-              B) XF=start_event_wrap.xml;;
-              D) XF=start_event_wrap_mc.xml;;
+              P) XF=start_event_P.xml;;
+              W) XF=start_event_W.xml;;
+              M) XF=start_event_M.xml;;
             esac
+            # restart engine if a previous variant crashed it
+            if ! pgrep -f "actionengined -ni" > /dev/null; then
+              echo "--- actionengined dead; restarting before variant $VAR ---"
+              eval "$AE_START"
+              sleep 8
+            fi
             # busctl 'ay' consumes: <element count> <count x byte values>
             CNT=$(sudo od -An -tu1 -v /opt/rootfs/tmp/$XF | tr -s ' \n' ' ' | sed 's/^ //;s/ $//' | wc -w)
             BYTES=$(sudo od -An -tu1 -v /opt/rootfs/tmp/$XF | tr -s ' \n' ' ' | sed 's/^ //;s/ $//')
@@ -217,7 +228,13 @@ jobs:
         run: |
           set +e
           echo "=== pre-flight: bus names owned (verbatim) ==="
-          timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl list --no-pager --no-legend 2>&1 | tee /tmp/busnames.log | grep -E "com\.axis|Switch|VirtualInput|GeoLocation|ActionEngine" | head -15
+          timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl list --no-pager --no-legend 2>&1 | tee /tmp/busnames.log | grep -E "^com\.axis" | grep -v activatable | head -10
+          echo "=== pre-flight: current ActionRule.List ==="
+          timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule List 2>&1 | tee /tmp/rulelist2.log | head -c 800
+          echo ""
+          if grep -q "a(isbayayuii) 0" /tmp/rulelist2.log; then
+            echo "!!! NO RULE BOUND - fire cannot trigger anything (captured verbatim above) !!!"
+          fi
           echo "--- daemons alive? ---"
           pgrep -af "qemu-aarch64" | head -8 || true
           echo "=== FIRE 1: uid 150 -> com.axis.VirtualInput /com/axis/VirtualInput/Port/1 Activate ==="
@@ -264,9 +281,9 @@ jobs:
             /tmp/step1.log
             /tmp/confadd.log
             /tmp/conflist.log
-            /tmp/ruleadd_A.log
-            /tmp/ruleadd_B.log
-            /tmp/ruleadd_D.log
+            /tmp/ruleadd_P.log
+            /tmp/ruleadd_W.log
+            /tmp/ruleadd_M.log
             /tmp/rulelist.log
             /tmp/fire1.log
             /tmp/fire2.log
