@@ -104,9 +104,15 @@ jobs:
 
       - name: Execute PoC command under qemu-user chroot
         run: |
-          # copy qemu interpreter into the rootfs for binfmt-free explicit invocation
-          sudo cp /usr/bin/qemu-aarch64-static /opt/rootfs/usr/bin/ 2>/dev/null || true
-          sudo mount --bind /proc /opt/rootfs/proc 2>/dev/null || sudo mount -t proc proc /opt/rootfs/proc
+          set -x
+          sudo cp /usr/bin/qemu-aarch64-static /opt/rootfs/usr/bin/ || echo "cp qemu failed"
+          sudo mount --bind /proc /opt/rootfs/proc 2>/dev/null || sudo mount -t proc proc /opt/rootfs/proc || echo "proc mount failed"
+          ls -la /opt/rootfs/bin /opt/rootfs/usr/bin/qemu-aarch64-static 2>&1 | head -8
+          readlink -f /opt/rootfs/bin/sh || echo "no /bin/sh"
+          echo "=== DIRECT BUSYBOX EXEC ==="
+          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busybox.nosuid echo DIRECT-OK; echo "direct exit: $?"
+          echo "=== SH WRAPPED EXEC ==="
+          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /bin/sh -c "echo SH-OK; id"; echo "sh exit: $?"
           echo "=== POC COMMAND ==="
           echo "${{ github.event.inputs.run_cmd }}"
           echo "=== EXECUTION OUTPUT (verbatim) ==="
