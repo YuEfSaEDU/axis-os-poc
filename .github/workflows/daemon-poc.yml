@@ -1,0 +1,154 @@
+name: daemon-authz-poc
+# Executed-proof harness (daemon layer): starts the extracted AXIS OS daemons under
+# qemu-user inside a chroot and drives their control sockets from a DIFFERENT uid,
+# proving/disproving caller-authorization behavior of the daemon itself.
+# Verbatim outputs are the PoC artifacts.
+on:
+  workflow_dispatch:
+    inputs:
+      firmware_url:
+        description: "Official ftp.axis.com .bin URL"
+        required: true
+      firmware_sha256:
+        description: "Expected SHA256 of the .bin"
+        required: true
+
+jobs:
+  poc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-user-static zstd python3-pip gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+          python3 -m pip install --quiet PySquashfsImage zstandard
+
+      - name: Download and verify official firmware
+        run: |
+          cd /tmp
+          curl -sS -o fw.bin "${{ github.event.inputs.firmware_url }}"
+          echo "${{ github.event.inputs.firmware_sha256 }}  fw.bin" | sha256sum -c -
+
+      - name: Unpack container + extract rootfs (real symlinks)
+        run: |
+          cd /tmp
+          python3 - <<'EOF'
+          import gzip, tarfile, os, sys
+          magic = open('fw.bin','rb').read(4)
+          if magic[:2] == b'\x1f\x8b':
+              raw = gzip.open('fw.bin','rb').read()
+          elif magic == b'\x28\xb5\x2f\xfd':
+              import zstandard
+              raw = zstandard.ZstdDecompressor().stream_reader(open('fw.bin','rb')).read()
+          else:
+              sys.exit('unknown container magic %r' % magic)
+          open('fw.tar','wb').write(raw)
+          tf = tarfile.open('fw.tar'); tf.extractall('pkg')
+          from PySquashfsImage import SquashFsImage
+          img = SquashFsImage(open('pkg/rootfs.img','rb'))
+          def sanitize(n):
+              for c in '\\/:*?"<>|': n = n.replace(c,'_')
+              return n
+          def walk(node, outdir):
+              name = node.name
+              if isinstance(name, bytes): name = name.decode('utf-8','replace')
+              path = os.path.join(outdir, sanitize(name))
+              if node.is_dir:
+                  os.makedirs(path, exist_ok=True)
+                  for ch in node.iterdir():
+                      try: walk(ch, path)
+                      except Exception as e: print('walk fail', path, e)
+                  return
+              if node.is_symlink:
+                  t = node.readlink()
+                  if isinstance(t, bytes): t = t.decode('utf-8','replace')
+                  try:
+                      if os.path.lexists(path): os.remove(path)
+                      os.symlink(t, path)
+                  except (OSError, ValueError):
+                      open(path + '.symlink','w').write(t)
+                  return
+              try: data = img.read_file(node.inode)
+              except Exception as e:
+                  print('read fail', path, e); return
+              if data is None: return
+              open(path,'wb').write(data)
+              try: os.chmod(path, node.mode & 0o777)
+              except OSError: pass
+          os.makedirs('rootfs', exist_ok=True)
+          for ch in img.root.iterdir(): walk(ch, 'rootfs')
+          print('rootfs extracted')
+          EOF
+          sudo mv /tmp/rootfs /opt/rootfs
+
+      - name: Provision chroot runtime dirs + cross-compile client
+        run: |
+          # dangling-symlink runtime dirs -> real dirs (device has tmpfs there)
+          sudo rm -f /opt/rootfs/var/run /opt/rootfs/var/tmp /opt/rootfs/var/volatile /opt/rootfs/tmp
+          sudo mkdir -p /opt/rootfs/var/run/dbg-cgi /opt/rootfs/var/run/dbus /opt/rootfs/var/tmp /opt/rootfs/tmp /opt/rootfs/var/lib/dbus
+          sudo chmod 1777 /opt/rootfs/tmp
+          sudo mknod /opt/rootfs/dev/null c 1 3 2>/dev/null || true
+          sudo chmod 666 /opt/rootfs/dev/null 2>/dev/null || true
+          gcc-aarch64-linux-gnu -static -O2 -o /tmp/dbox_client targets/axis-os/poc-harness/dbox_client.c 2>/dev/null || \
+            gcc-aarch64-linux-gnu -static -O2 -o /tmp/dbox_client dbox_client.c
+          file /tmp/dbox_client
+          sudo cp /tmp/dbox_client /opt/rootfs/tmp/dbox_client
+          sudo cp /usr/bin/qemu-aarch64-static /opt/rootfs/usr/bin/
+
+      - name: Start dbox daemon (uid 503) and drive its control socket cross-uid
+        run: |
+          echo "=== START dbox (debugar.cgi -n) as root-in-chroot; it self-setuid()s to debugar(503) ==="
+          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/sbin/debugar.cgi -n > /tmp/dbox.log 2>&1 &
+          sleep 6
+          sudo ls -la /opt/rootfs/var/run/dbg-cgi/ || true
+          echo "=== dbox process + socket facts ==="
+          pgrep -af qemu-aarch64 | head -3 || true
+          sudo cat /tmp/dbox.log | head -10 || true
+          echo "=== CLIENT 1: uid/gid 150 (= www, the uid Apache uses) calls cmd=ps; daemon runs as 503 ==="
+          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/dbox_client 150 150 "cmd=ps" 2>&1 | tee /tmp/client1.log
+          echo "=== client1 exit: $? ==="
+          echo "=== CLIENT 2 (control): uid/gid 65534 (nogroup) — kernel socket gate expected to reject (EACCES) ==="
+          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/dbox_client 65534 65534 "cmd=ps" 2>&1 | tee /tmp/client2.log
+          echo "=== client2 exit: $? ==="
+          echo "=== response files ==="
+          sudo ls -la /opt/rootfs/tmp/dbox_out_* 2>/dev/null || true
+          for f in /opt/rootfs/tmp/dbox_out_*; do echo "--- $f (head) ---"; sudo head -25 "$f" 2>/dev/null; done
+          echo "=== END ==="
+
+      - name: Attempt actionengined with system bus (known -107 risk; honest capture)
+        continue-on-error: true
+        run: |
+          set +e
+          echo "=== start dbus-daemon --system inside chroot ==="
+          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/dbus-uuidgen --ensure 2>&1 | head -2
+          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/dbus-daemon --system --nofork --nopidfile --address=unix:path=/var/run/dbus/system_bus_socket > /tmp/dbus.log 2>&1 &
+          sleep 5
+          sudo ls -la /opt/rootfs/var/run/dbus/ || true
+          echo "=== busctl (sanity: bus reachable) ==="
+          timeout 20 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl --no-pager list 2>&1 | head -10
+          echo "=== start actionengined ==="
+          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/actionengined > /tmp/ae.log 2>&1 &
+          sleep 8
+          echo "=== actionengined log (verbatim) ==="
+          sudo cat /tmp/ae.log | head -20
+          echo "=== actionengined alive? ==="
+          pgrep -af actionengined | head -2 || echo "actionengined not running"
+          echo "=== if alive: busctl introspect ActionEngine ==="
+          timeout 20 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl --no-pager introspect com.axis.Event.ActionEngine.User /com/axis/Event/ActionEngine/ActionTemplate 2>&1 | head -20
+          echo "=== END actionengined attempt ==="
+
+      - name: Archive logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daemon-poc-logs
+          path: |
+            /tmp/client1.log
+            /tmp/client2.log
+            /tmp/dbox.log
+            /tmp/ae.log
+            /tmp/dbus.log
+          if-no-files-found: ignore
