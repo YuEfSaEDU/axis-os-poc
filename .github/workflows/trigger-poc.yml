@@ -112,7 +112,8 @@ jobs:
           #include <stdlib.h>
           extern char **environ;
           int posix_spawn(pid_t *pid, const char *path,
-                          const void *file_actions, const void *attrp,
+                          const posix_spawn_file_actions_t *fa,
+                          const posix_spawnattr_t *sa,
                           char *const argv[], char *const envp[]) {
               pid_t p = fork();
               if (p < 0) return -1;
@@ -121,9 +122,10 @@ jobs:
               return 0;
           }
           int posix_spawnp(pid_t *pid, const char *file,
-                           const void *file_actions, const void *attrp,
+                           const posix_spawn_file_actions_t *fa,
+                           const posix_spawnattr_t *sa,
                            char *const argv[], char *const envp[]) {
-              return posix_spawn(pid, file, file_actions, attrp, argv, envp ? envp : environ);
+              return posix_spawn(pid, file, fa, sa, argv, envp ? envp : environ);
           }
           SHIM
           aarch64-linux-gnu-gcc -shared -fPIC -O2 -o /tmp/spawnshim.so /tmp/spawnshim.c && file /tmp/spawnshim.so
