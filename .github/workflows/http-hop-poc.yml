@@ -108,7 +108,14 @@ jobs:
           sudo mknod /opt/rootfs/dev/null c 1 3 2>/dev/null || true
           sudo mknod /opt/rootfs/dev/urandom c 1 9 2>/dev/null || true
           sudo mknod /opt/rootfs/dev/random c 1 8 2>/dev/null || true
-          sudo chmod 666 /opt/rootfs/dev/null /opt/rootfs/dev/urandom /opt/rootfs/dev/random 2>/dev/null || true
+          sudo mknod /opt/rootfs/dev/zero c 1 5 2>/dev/null || true
+          sudo mknod /opt/rootfs/dev/console c 5 1 2>/dev/null || true
+          sudo chmod 666 /opt/rootfs/dev/null /opt/rootfs/dev/urandom /opt/rootfs/dev/random /opt/rootfs/dev/zero 2>/dev/null || true
+          # shm_open (mod_proxy slotmem) and APR shm need /dev/shm inside the chroot
+          # (device: tmpfs); mod_proxy AH02478/AH00016 without it.
+          sudo mkdir -p /opt/rootfs/dev/shm
+          sudo chmod 1777 /opt/rootfs/dev/shm
+          sudo mkdir -p /opt/rootfs/usr/logs/proxy
 
           # ---- /run/apache2/parameters.conf (replicates httpd-generate-config output;
           #      defaults from httpd_parload/httpd_vega_parload normalization) ----
