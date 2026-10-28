@@ -104,7 +104,7 @@ jobs:
           sudo chmod 666 /opt/rootfs/dev/null 2>/dev/null || true
           aarch64-linux-gnu-gcc -static -O2 -o /tmp/runas targets/axis-os/poc-harness/runas.c 2>/dev/null || \
             aarch64-linux-gnu-gcc -static -O2 -o /tmp/runas runas.c
-          printf '#!/bin/sh\necho "BCWRAP argc=$# argv: $@" >> /tmp/bcwrap.log\nexec /usr/bin/busctl "$@"\n' > /tmp/bcwrap.sh
+          printf '#!/bin/sh\ni=0\nfor a in "$@"; do i=$((i+1)); echo "BCWRAP arg[$i]=<$a>" >&2; done\nexec /usr/bin/busctl "$@"\n' > /tmp/bcwrap.sh
           chmod 755 /tmp/bcwrap.sh
           file /tmp/runas
           sudo cp /tmp/runas /opt/rootfs/tmp/
@@ -234,13 +234,13 @@ jobs:
             echo "ruleAdd variant $VAR exit: $?"
             if grep -qE '^(s|i|u|o|b) ' /tmp/ruleadd_$VAR.log; then echo "RULE ADDED (variant $VAR)"; break; fi
           done
-          echo "=== T1: argv ground-truth dump (minimal call through wrapper) ==="
           if ! pgrep -f "actionengined -ni" > /dev/null; then eval "$AE_START"; sleep 8; fi
-          timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /tmp/bcwrap.sh call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule Add sbayayuuuii "poc_rule_t1" true 0 0 0 0 0 0 12 -1 2>&1 | tee /tmp/t1.log | head -4
-          echo "=== T2: fallback=0, no dashdash ==="
-          timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /tmp/bcwrap.sh call --no-pager com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule Add sbayayuuuii "poc_rule_t2" true 0 0 0 0 0 0 12 0 2>&1 | tee /tmp/t2.log | head -4
-          echo "=== T3: fallback=0, with dashdash ==="
-          timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /tmp/bcwrap.sh call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule Add sbayayuuuii "poc_rule_t3" true 0 0 0 0 0 0 12 0 2>&1 | tee /tmp/t3.log | head -4
+          echo "=== T-LADDER: param-count bisect (expect flip between too-few and too-many at k=10) ==="
+          for K in 7 8 9 10; do
+            FILL=$(seq 1 $((K-2)) | sed 's/^/0 /')
+            echo "--- K=$K params: poc_ladder true $FILL ---"
+            timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /tmp/bcwrap.sh call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule Add sbayayuuuii "poc_ladder" true $FILL 2>&1 | head -3
+          done
           echo "=== ActionRule.List (verbatim) ==="
           timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule List 2>&1 | tee /tmp/rulelist.log | head -c 1500
           echo ""
