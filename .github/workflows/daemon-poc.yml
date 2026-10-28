@@ -87,8 +87,11 @@ jobs:
       - name: Provision chroot runtime dirs + cross-compile client
         run: |
           # dangling-symlink runtime dirs -> real dirs (device has tmpfs there)
-          sudo rm -f /opt/rootfs/var/run /opt/rootfs/var/tmp /opt/rootfs/var/volatile /opt/rootfs/tmp
-          sudo mkdir -p /opt/rootfs/var/run/dbg-cgi /opt/rootfs/var/run/dbus /opt/rootfs/var/tmp /opt/rootfs/tmp /opt/rootfs/var/lib/dbus
+          for p in var/run var/tmp var/volatile tmp; do
+            if [ -L "/opt/rootfs/$p" ]; then sudo rm -f "/opt/rootfs/$p"; fi
+            sudo mkdir -p "/opt/rootfs/$p"
+          done
+          sudo mkdir -p /opt/rootfs/var/run/dbg-cgi /opt/rootfs/var/run/dbus /opt/rootfs/var/lib/dbus
           sudo chmod 1777 /opt/rootfs/tmp
           sudo mknod /opt/rootfs/dev/null c 1 3 2>/dev/null || true
           sudo chmod 666 /opt/rootfs/dev/null 2>/dev/null || true
