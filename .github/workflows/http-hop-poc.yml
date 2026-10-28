@@ -172,38 +172,46 @@ jobs:
           echo "=== digest_auth_passwd ==="; sudo cat /opt/rootfs/etc/apache2/digest_auth_passwd
           echo "=== group_auth ==="; sudo cat /opt/rootfs/etc/apache2/group_auth
 
-      - name: Start dbox daemon (must predate apache), then Apache -X under qemu
+      - name: dbox + Apache + full HTTP chain (single session) with deep diagnostics
+        id: chain
+        continue-on-error: true
         run: |
-          echo "=== START dbox (debugar.cgi -n) in chroot; self-setuid to debugar(503) on device ==="
+          set +e
+          echo "=== [D1] shared-lib resolution for httpd.apache2 ==="
+          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /lib/ld-linux-aarch64.so.1 --list /usr/sbin/httpd.apache2 2>&1 | head -30
+          echo "ld exit: $?"
+
+          echo "=== [D2] foreground config test: httpd -t (stderr passthrough) ==="
+          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/sbin/httpd.apache2 -t
+          echo "configtest exit: $?"
+
+          echo "=== [D3] start dbox (debugar.cgi -n) ==="
           sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/sbin/debugar.cgi -n > /tmp/dbox.log 2>&1 &
           sleep 6
           sudo ls -la /opt/rootfs/var/run/dbg-cgi/ || true
 
-          echo "=== START shipped Apache (httpd.apache2 -X, single-process foreground) ==="
+          echo "=== [D4] start shipped Apache (httpd.apache2 -X) ==="
           sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/sbin/httpd.apache2 -X -E /tmp/httpd-err.log > /tmp/httpd.log 2>&1 &
-          sleep 10
+          sleep 12
           echo "=== processes ==="
           pgrep -af qemu-aarch64 | head -6 || true
-          echo "=== httpd stdout/stderr ==="
-          sudo cat /tmp/httpd.log 2>/dev/null | head -20
-          echo "=== httpd -E startup error log (verbatim) ==="
-          sudo cat /tmp/httpd-err.log 2>/dev/null | head -40
+          echo "=== httpd stdout/stderr file ==="
+          ls -la /tmp/httpd.log /tmp/httpd-err.log 2>&1
+          echo "--- /tmp/httpd.log ---";    sudo cat /tmp/httpd.log 2>/dev/null | head -25
+          echo "--- /tmp/httpd-err.log ---"; sudo cat /tmp/httpd-err.log 2>/dev/null | head -50
           echo "=== listeners (port 80) ==="
           sudo ss -ltn | grep -E ':80\b' || echo "NOTHING LISTENING ON :80"
-          echo "=== dbox socket ==="
-          sudo ls -la /opt/rootfs/var/run/dbg-cgi/ || true
 
-      - name: HTTP chain requests (verbatim captures)
-        continue-on-error: true
-        run: |
-          set +e
+          if ! sudo ss -ltn | grep -qE ':80\b'; then
+            echo "=== [D5] apache not up: qemu -strace of config test (first 160 syscalls) ==="
+            sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static -strace /usr/sbin/httpd.apache2 -t 2>&1 | tail -120
+          fi
+
+          echo "=== (a) NO-AUTH viewer route: GET debug.cgi?mon (expect 401 digest challenge) ==="
           HOSTIP=$(hostname -I | awk '{print $1}')
-          echo "HOSTIP=$HOSTIP"
           D="http://$HOSTIP/axis-cgi/debug/debug.cgi?mon"
           FW="http://$HOSTIP/axis-cgi/firmwaremanagement.cgi"
           DISKS="http://$HOSTIP/axis-cgi/disks/list.cgi"
-
-          echo "=== (a) NO-AUTH viewer route: GET debug.cgi?mon (expect 401 digest challenge) ==="
           curl -sS -i --max-time 20 "$D" 2>&1 | tee /tmp/resp_a_noauth.txt | head -20
 
           echo "=== (b) VIEWER TIER: viewer1 digest on debug.cgi?mon -> mod_trax -> dbox ==="
@@ -224,7 +232,7 @@ jobs:
           echo "=== (e) in-chroot aarch64 curl to ::1 (in-device observation) viewer1 on debug route ==="
           sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/curl -sS -i --digest --max-time 30 -u viewer1:viewer1pass "http://[::1]/axis-cgi/debug/debug.cgi?mon" 2>&1 | tee /tmp/resp_e_inchroot.txt | head -45
 
-          echo "=== apache runtime view of the transfer (error log tail) ==="
+          echo "=== apache error log tail after requests ==="
           sudo cat /tmp/httpd-err.log 2>/dev/null | tail -30
           echo "=== dbox log ==="
           sudo cat /tmp/dbox.log 2>/dev/null | head -20
