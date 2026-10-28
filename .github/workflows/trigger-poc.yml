@@ -105,6 +105,29 @@ jobs:
           aarch64-linux-gnu-gcc -static -O2 -o /tmp/runas targets/axis-os/poc-harness/runas.c 2>/dev/null || \
             aarch64-linux-gnu-gcc -static -O2 -o /tmp/runas runas.c
           printf '#!/bin/sh\ni=0\nfor a in "$@"; do i=$((i+1)); echo "BCWRAP arg[$i]=<$a>" >&2; done\nexec /usr/bin/busctl "$@"\n' > /tmp/bcwrap.sh
+          cat > /tmp/spawnshim.c <<'SHIM'
+          #define _GNU_SOURCE
+          #include <spawn.h>
+          #include <unistd.h>
+          #include <stdlib.h>
+          extern char **environ;
+          int posix_spawn(pid_t *pid, const char *path,
+                          const void *file_actions, const void *attrp,
+                          char *const argv[], char *const envp[]) {
+              pid_t p = fork();
+              if (p < 0) return -1;
+              if (p == 0) { execve(path, argv, envp ? envp : environ); _exit(127); }
+              if (pid) *pid = p;
+              return 0;
+          }
+          int posix_spawnp(pid_t *pid, const char *file,
+                           const void *file_actions, const void *attrp,
+                           char *const argv[], char *const envp[]) {
+              return posix_spawn(pid, file, file_actions, attrp, argv, envp ? envp : environ);
+          }
+          SHIM
+          aarch64-linux-gnu-gcc -shared -fPIC -O2 -o /tmp/spawnshim.so /tmp/spawnshim.c && file /tmp/spawnshim.so
+          sudo cp /tmp/spawnshim.so /opt/rootfs/tmp/
           chmod 755 /tmp/bcwrap.sh
           file /tmp/runas
           sudo cp /tmp/runas /opt/rootfs/tmp/
@@ -129,8 +152,8 @@ jobs:
           sleep 6
           echo "--- virtualinputd log (verbatim) ---"
           sudo cat /tmp/vinput.log | head -20
-          echo "=== start actionengined (consumer + the ROOT action executor) ==="
-          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/actionengined -ni actionengined.system -c /usr/share/actionengine/action_engine_system.conf > /tmp/ae.log 2>&1 &
+          echo "=== start actionengined (consumer + the ROOT action executor, spawn shim preloaded) ==="
+          sudo chroot /opt/rootfs /usr/bin/env LD_PRELOAD=/tmp/spawnshim.so /usr/bin/qemu-aarch64-static /usr/bin/actionengined -ni actionengined.system -c /usr/share/actionengine/action_engine_system.conf > /tmp/ae.log 2>&1 &
           sleep 8
           echo "--- actionengined log (verbatim) ---"
           sudo cat /tmp/ae.log | head -30
@@ -214,7 +237,7 @@ jobs:
           </property>
           XML
           if [ -z "${CONF_ID}" ]; then CONF_ID=12; fi
-          AE_START="sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/actionengined -ni actionengined.system -c /usr/share/actionengine/action_engine_system.conf > /tmp/ae.log 2>&1 &"
+          AE_START="sudo chroot /opt/rootfs /usr/bin/env LD_PRELOAD=/tmp/spawnshim.so /usr/bin/qemu-aarch64-static /usr/bin/actionengined -ni actionengined.system -c /usr/share/actionengine/action_engine_system.conf > /tmp/ae.log 2>&1 &"
           if ! pgrep -f "actionengined -ni" > /dev/null; then eval "$AE_START"; sleep 8; fi
           CNT=$(sudo od -An -tu1 -v /opt/rootfs/tmp/rule_C.xml | tr -s ' \n' ' ' | sed 's/^ //;s/ $//' | wc -w)
           BYTES=$(sudo od -An -tu1 -v /opt/rootfs/tmp/rule_C.xml | tr -s ' \n' ' ' | sed 's/^ //;s/ $//')
@@ -318,6 +341,7 @@ jobs:
             /tmp/rulelist.log
             /tmp/rulelist0.log
             /tmp/ae2.log
+            /tmp/spawnshim.so
             /tmp/fire1.log
             /tmp/fire2.log
             /tmp/e5.log
