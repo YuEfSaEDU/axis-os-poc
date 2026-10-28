@@ -164,7 +164,7 @@ jobs:
           XML
           sudo chmod 644 /opt/rootfs/tmp/ae_poc.xml
           echo "=== uid 150 calls AddFromFile through the dbus policy (setresuid inside chroot) ==="
-          timeout 25 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /usr/bin/busctl call --no-pager com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine/ActionTemplate com.axis.Event.ActionEngine.ActionTemplate AddFromFile s "/tmp/ae_poc.xml" 2>&1 | head -10
+          timeout 25 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /usr/bin/busctl call --no-pager com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionTemplate AddFromFile s "/tmp/ae_poc.xml" 2>&1 | head -10
           echo "=== addcall exit: $? ==="
           sleep 3
           echo "=== proof file (written by ROOT daemon if validate_command ran) ==="
