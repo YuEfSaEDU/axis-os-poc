@@ -137,9 +137,11 @@ jobs:
           echo "--- geolocationd log (verbatim, first lines) ---"
           sudo cat /tmp/geo.log | head -10
           echo "=== bus names owned (verbatim) ==="
-          timeout 20 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl --no-pager list 2>&1 | head -15
+          timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl list --no-pager --no-legend 2>&1 | grep -E "com\.axis|Event\.Switch|VirtualInput|GeoLocation" | head -15
           echo "=== daemons alive? ==="
           pgrep -af "qemu-aarch64" | head -8 || true
+          echo "=== introspect event_switch (verbatim, first lines) ==="
+          timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl introspect --no-pager com.axis.Event.Switch /com/axis/Event/Switch 2>&1 | head -20
 
       - name: uid-150 installs action template (AddFromFile, known-good) + creates configuration + rule
         run: |
@@ -169,74 +171,81 @@ jobs:
           sudo chmod 644 /opt/rootfs/tmp/ae_poc.xml
           rm -f /opt/rootfs/tmp/proof_ae
           echo "=== STEP 1: uid 150 -> ActionTemplate.AddFromFile ==="
-          timeout 25 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /usr/bin/busctl call --no-pager com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionTemplate AddFromFile s "/tmp/ae_poc.xml" 2>&1 | head -6
+          timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /usr/bin/busctl call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionTemplate AddFromFile s "/tmp/ae_poc.xml" 2>&1 | tee /tmp/step1.log | head -6
           echo "step1 exit: $?"
           sleep 2
-          echo "=== STEP 2: uid 150 -> ActionConfiguration.Add (binds template; try (template_id, nice_name) then swap) ==="
-          timeout 25 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /usr/bin/busctl call --no-pager com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionConfiguration Add ssa{ss} "com.axis.action.poc.ae001" "poc_conf" 0 2>&1 | tee /tmp/confadd_a.log | head -6
-          echo "step2a exit: $?"
-          if ! grep -q '^s "' /tmp/confadd_a.log; then
-            echo "--- variant B: (nice_name, template_id) ---"
-            timeout 25 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /usr/bin/busctl call --no-pager com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionConfiguration Add ssa{ss} "poc_conf" "com.axis.action.poc.ae001" 0 2>&1 | tee /tmp/confadd_b.log | head -6
-            echo "step2b exit: $?"
-          fi
-          CONF_ID=$(grep -ohE '[0-9]+' /tmp/confadd_a.log /tmp/confadd_b.log 2>/dev/null | head -1)
+          echo "=== STEP 2: uid 150 -> ActionConfiguration.Add(nice_name, template_id, params) [proven order] ==="
+          timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /usr/bin/busctl call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionConfiguration Add ssa{ss} "poc_conf" "com.axis.action.poc.ae001" 0 2>&1 | tee /tmp/confadd.log | head -6
+          echo "step2 exit: $?"
+          CONF_ID=$(grep -ohE '^i [0-9]+' /tmp/confadd.log | grep -ohE '[0-9]+' | head -1)
           echo "parsed primary config id: ${CONF_ID:-NONE}"
           echo "=== ActionConfiguration.List (verbatim) ==="
-          timeout 25 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl call --no-pager com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionConfiguration List 2>&1 | head -10
-          echo "=== STEP 3: build start_event XML (topic = VirtualInput declaration file) and try ActionRule.Add variants ==="
+          timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionConfiguration List 2>&1 | tee /tmp/conflist.log | head -c 1500
+          echo ""
+          echo "=== STEP 3: build start_event XML variants and try ActionRule.Add ==="
           sudo tee /opt/rootfs/tmp/start_event.xml > /dev/null <<'XML'
           <?xml version="1.0" encoding="UTF-8"?><wsnt:TopicExpression xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" xmlns:tns1="http://www.onvif.org/ver10/topics" xmlns:tnsaxis="http://www.axis.com/2009/event/topics" Dialect="http://docs.oasis-open.org/wsn/t-1/TopicExpression/Concrete">tns1:Device/tnsaxis:IO/tnsaxis:VirtualInput</wsnt:TopicExpression>
           XML
-          sudo cp /opt/rootfs/tmp/start_event.xml /opt/rootfs/tmp/start_event_cset.xml
-          sudo sed -i 's#http://docs.oasis-open.org/wsn/t-1/TopicExpression/Concrete#http://www.onvif.org/ver10/tev/topicExpression/ConcreteSet#' /opt/rootfs/tmp/start_event_cset.xml
           sudo tee /opt/rootfs/tmp/start_event_wrap.xml > /dev/null <<'XML'
           <?xml version="1.0" encoding="UTF-8"?><StartEvent><wsnt:TopicExpression xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" xmlns:tns1="http://www.onvif.org/ver10/topics" xmlns:tnsaxis="http://www.axis.com/2009/event/topics" Dialect="http://docs.oasis-open.org/wsn/t-1/TopicExpression/Concrete">tns1:Device/tnsaxis:IO/tnsaxis:VirtualInput</wsnt:TopicExpression></StartEvent>
           XML
-          if [ -z "${CONF_ID}" ]; then CONF_ID=1; fi
-          for VAR in A B C; do
+          sudo tee /opt/rootfs/tmp/start_event_wrap_mc.xml > /dev/null <<'XML'
+          <?xml version="1.0" encoding="UTF-8"?><StartEvent><wsnt:TopicExpression xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" xmlns:tnsaxis="http://www.axis.com/2009/event/topics" Dialect="http://docs.oasis-open.org/wsn/t-1/TopicExpression/Concrete">tnsaxis:SendEvent</wsnt:TopicExpression><wsnt:MessageContent xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" Dialect="http://www.onvif.org/ver10/tev/messageContentFilter/ItemFilter">boolean(//SimpleItem[@Name="poc" and @Value="1"])</wsnt:MessageContent></StartEvent>
+          XML
+          if [ -z "${CONF_ID}" ]; then CONF_ID=12; fi
+          for VAR in A B D; do
             case $VAR in
               A) XF=start_event.xml;;
               B) XF=start_event_wrap.xml;;
-              C) XF=start_event_cset.xml;;
+              D) XF=start_event_wrap_mc.xml;;
             esac
             # busctl 'ay' consumes: <element count> <count x byte values>
             CNT=$(sudo od -An -tu1 -v /opt/rootfs/tmp/$XF | tr -s ' \n' ' ' | sed 's/^ //;s/ $//' | wc -w)
             BYTES=$(sudo od -An -tu1 -v /opt/rootfs/tmp/$XF | tr -s ' \n' ' ' | sed 's/^ //;s/ $//')
             echo "--- variant $VAR ($XF, $CNT bytes) ---"
-            timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /usr/bin/busctl call --no-pager com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule Add sbayayuuuii "poc_rule" true $CNT $BYTES 0 0 0 0 0 "${CONF_ID}" -1 2>&1 | tee /tmp/ruleadd_$VAR.log | head -6
+            timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /usr/bin/busctl call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule Add sbayayuuuii "poc_rule_$VAR" true $CNT $BYTES 0 0 0 0 0 "${CONF_ID}" -1 2>&1 | tee /tmp/ruleadd_$VAR.log | head -6
             echo "ruleAdd variant $VAR exit: $?"
-            if grep -qE '^(s|i|u) "' /tmp/ruleadd_$VAR.log; then echo "RULE ADDED (variant $VAR)"; break; fi
+            if grep -qE '^(s|i|u|o|b) ' /tmp/ruleadd_$VAR.log; then echo "RULE ADDED (variant $VAR)"; break; fi
           done
           echo "=== ActionRule.List (verbatim) ==="
-          timeout 25 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl call --no-pager com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule List 2>&1 | head -10
-          echo "=== rules persisted on disk? ==="
+          timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule List 2>&1 | tee /tmp/rulelist.log | head -c 1500
+          echo ""
+          echo "=== rules + configs persisted on disk? ==="
           sudo find /opt/rootfs/etc/actionengine -type f 2>/dev/null | head -10
 
-      - name: FIRE the bound event as uid 150 and check root-exec proof
+      - name: FIRE the bound event (Activate + send_event backup) as uid 150 and check root-exec proof
         run: |
           set +e
-          echo "=== uid 150 -> com.axis.VirtualInput.Port Activate on port 1 ==="
-          timeout 25 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /usr/bin/busctl call --no-pager com.axis.Event.VirtualInput /com/axis/VirtualInput/Port/1 com.axis.VirtualInput.Port Activate 2>&1 | head -6
+          echo "=== pre-flight: bus names owned (verbatim) ==="
+          timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl list --no-pager --no-legend 2>&1 | tee /tmp/busnames.log | grep -E "com\.axis|Switch|VirtualInput|GeoLocation|ActionEngine" | head -15
+          echo "--- daemons alive? ---"
+          pgrep -af "qemu-aarch64" | head -8 || true
+          echo "=== FIRE 1: uid 150 -> com.axis.VirtualInput /com/axis/VirtualInput/Port/1 Activate ==="
+          timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /usr/bin/busctl call --no-pager -- com.axis.VirtualInput /com/axis/VirtualInput/Port/1 com.axis.VirtualInput.Port Activate 2>&1 | tee /tmp/fire1.log | head -6
           echo "activate exit: $?"
           sleep 6
           echo "=== PROOF: /tmp/proof_ae (written by the ROOT actionengined process) ==="
-          sudo ls -la /opt/rootfs/tmp/proof_ae 2>/dev/null && sudo cat /opt/rootfs/tmp/proof_ae || echo "proof_ae NOT created"
-          echo "=== retry fire as root (transport sanity check) ==="
-          timeout 25 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl call --no-pager com.axis.Event.VirtualInput /com/axis/VirtualInput/Port/1 com.axis.VirtualInput.Port Deactivate 2>&1 | head -4
+          sudo ls -la /opt/rootfs/tmp/proof_ae 2>/dev/null && sudo cat /opt/rootfs/tmp/proof_ae || echo "proof_ae NOT created (after Activate)"
+          echo "=== FIRE 2 (backup producer): uid 150 -> send_event poc=1 ==="
+          sudo chmod 755 /opt/rootfs/usr/bin/send_event 2>/dev/null || true
+          timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /usr/bin/send_event poc=1 2>&1 | tee /tmp/fire2.log | head -6
+          echo "send_event exit: $?"
+          sleep 6
+          echo "=== PROOF after send_event ==="
+          sudo ls -la /opt/rootfs/tmp/proof_ae 2>/dev/null && sudo cat /opt/rootfs/tmp/proof_ae || echo "proof_ae NOT created (after send_event)"
+          echo "=== FIRE 3 (root-side Activate sanity) ==="
+          timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl call --no-pager -- com.axis.VirtualInput /com/axis/VirtualInput/Port/1 com.axis.VirtualInput.Port Deactivate 2>&1 | head -4
           sleep 3
-          timeout 25 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl call --no-pager com.axis.Event.VirtualInput /com/axis/VirtualInput/Port/1 com.axis.VirtualInput.Port Activate 2>&1 | head -4
+          timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl call --no-pager -- com.axis.VirtualInput /com/axis/VirtualInput/Port/1 com.axis.VirtualInput.Port Activate 2>&1 | head -4
           sleep 6
           echo "=== PROOF after root-side fire ==="
           sudo ls -la /opt/rootfs/tmp/proof_ae 2>/dev/null && sudo cat /opt/rootfs/tmp/proof_ae || echo "proof_ae NOT created"
-          echo "=== event_switch + virtualinputd + actionengined logs (tail) ==="
-          sudo tail -15 /tmp/event_switch.log 2>/dev/null
-          echo "---"
-          sudo tail -15 /tmp/vinput.log 2>/dev/null
-          echo "---"
-          sudo tail -25 /tmp/ae.log 2>/dev/null
-          echo "=== E5 CONTROL: uid 150 -> com.axis.GeoLocation1 (default-deny policy) expect Access denied ==="
-          timeout 25 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /usr/bin/busctl call --no-pager com.axis.GeoLocation1 /com/axis/GeoLocation org.freedesktop.DBus.Properties Get ss "com.axis.GeoLocation1" "Version" 2>&1 | head -6
+          echo "=== daemon logs (tails, verbatim) ==="
+          echo "--- event_switch ---"; sudo tail -20 /tmp/event_switch.log 2>/dev/null
+          echo "--- virtualinputd ---"; sudo tail -20 /tmp/vinput.log 2>/dev/null
+          echo "--- actionengined ---"; sudo tail -30 /tmp/ae.log 2>/dev/null
+          echo "=== E5 CONTROL: uid 150 -> com.axis.GeoLocation1 Properties (default-deny) expect Access denied ==="
+          timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /usr/bin/busctl call --no-pager -- com.axis.GeoLocation1 /com/axis/GeoLocation org.freedesktop.DBus.Properties Get ss "com.axis.GeoLocation1" "Version" 2>&1 | tee /tmp/e5.log | head -6
           echo "e5 exit: $?"
           echo "=== END ==="
 
@@ -251,9 +260,15 @@ jobs:
             /tmp/event_switch.log
             /tmp/vinput.log
             /tmp/geo.log
-            /tmp/confadd_a.log
-            /tmp/confadd_b.log
+            /tmp/busnames.log
+            /tmp/step1.log
+            /tmp/confadd.log
+            /tmp/conflist.log
             /tmp/ruleadd_A.log
             /tmp/ruleadd_B.log
-            /tmp/ruleadd_C.log
+            /tmp/ruleadd_D.log
+            /tmp/rulelist.log
+            /tmp/fire1.log
+            /tmp/fire2.log
+            /tmp/e5.log
           if-no-files-found: ignore
