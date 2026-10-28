@@ -36,7 +36,7 @@ int main(int argc, char **argv) {
     if (setresuid(uid, uid, uid) != 0) { perror("setresuid"); return 2; }
     printf("CLIENT uid=%d gid=%d euid=%d: connecting to %s\n", getuid(), getgid(), geteuid(), SOCK_PATH);
 
-    int s = socket(AF_UNIX, SOCK_STREAM, 0);
+    int s = socket(AF_UNIX, SOCK_DGRAM, 0); /* libfdipc fdipc_client_socket: socket(AF_UNIX=1, type=2 SOCK_DGRAM, 0) */
     if (s < 0) { perror("socket"); return 2; }
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof addr);
