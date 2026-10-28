@@ -179,6 +179,22 @@ jobs:
           sudo printf 'storage:%s\n' "$SVC" | sudo tee /opt/rootfs/etc/apache2/basic_auth_passwd > /dev/null
           sudo chmod 644 /opt/rootfs/etc/apache2/digest_auth_passwd /opt/rootfs/etc/apache2/group_auth /opt/rootfs/etc/apache2/basic_auth_passwd
 
+          # ---- DIAGNOSTIC-ONLY auth bisect probe (removed before final proof) ----
+          sudo tee /opt/rootfs/run/apache2/virtualhosts/zzprobe.conf > /dev/null <<'EOF'
+          <Location "/probe-loc">
+            AuthType Digest
+            AuthName PROBELOC
+            AuthUserFile /etc/apache2/digest_auth_passwd
+            Require valid-user
+          </Location>
+          <Directory "/usr/html/errors">
+            AuthType Digest
+            AuthName PROBEDIR
+            AuthUserFile /etc/apache2/digest_auth_passwd
+            Require valid-user
+          </Directory>
+          EOF
+
           sudo cp /usr/bin/qemu-aarch64-static /opt/rootfs/usr/bin/
           sudo ls -la /opt/rootfs/run/apache2/ /opt/rootfs/run/apache2/virtualhosts/
           echo "=== digest_auth_passwd ==="; sudo cat /opt/rootfs/etc/apache2/digest_auth_passwd
@@ -206,7 +222,7 @@ jobs:
           # -c "LogLevel warn": DIAGNOSTIC ONLY (verbosity; the shipped module-specific
           # LogLevel emerg/crit line would otherwise suppress auth debugging). No auth
           # directive is altered; the shipped files remain untouched on disk.
-          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/sbin/httpd.apache2 -X -c "LogLevel debug" > /tmp/httpd.log 2>&1 &
+          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/sbin/httpd.apache2 -X -c "LogLevel debug" -c "ErrorLog /tmp/httpd-err2.log" > /tmp/httpd.log 2>&1 &
           UP=""
           for i in $(seq 1 14); do
             sleep 3
@@ -263,8 +279,16 @@ jobs:
             echo "--- no-auth GET $TGT ---"
             curl -sS -i --max-time 10 "$TGT" 2>&1 | head -8
           done
-          echo "--- auth-related lines from httpd.log after probes ---"
-          grep -iE "authz|auth_digest|auth_basic|authoriz|directory|axisgroup" /tmp/httpd.log | tail -40
+          echo "--- auth bisect: /probe-loc (Location-based digest; expect 401 if Location auth works) ---"
+          curl -sS -i --max-time 10 "http://[::1]/probe-loc" 2>&1 | head -8
+          echo "--- auth bisect: /errors/403forbidden.html (Directory-based digest on /usr/html/errors) ---"
+          curl -sS -i --max-time 10 "http://[::1]/errors/403forbidden.html" 2>&1 | head -8
+          echo "--- auth bisect: viewer1 --digest /probe-loc (expect 200/404-if-missing = auth WORKS) ---"
+          curl -sS -i --digest --max-time 15 -u viewer1:viewer1pass "http://[::1]/probe-loc" 2>&1 | head -6
+          echo "--- auth-related lines from error log (LogLevel debug) after probes ---"
+          sudo grep -aiE "authz|auth_digest|auth_basic|authorization|axisgroup|denied|granted|Auth" /opt/rootfs/tmp/httpd-err2.log 2>/dev/null | tail -50
+          echo "--- error log raw tail ---"
+          sudo tail -25 /opt/rootfs/tmp/httpd-err2.log 2>/dev/null
           echo "--- viewer1 --digest on [::1] static ---"
           curl -sS -i --digest --max-time 15 -u viewer1:viewer1pass "http://[::1]/axis-release/info.properties" 2>&1 | head -12
           sleep 1
