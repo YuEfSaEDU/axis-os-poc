@@ -91,7 +91,7 @@ jobs:
             if [ -L "/opt/rootfs/$p" ]; then sudo rm -f "/opt/rootfs/$p"; fi
             sudo mkdir -p "/opt/rootfs/$p"
           done
-          sudo mkdir -p /opt/rootfs/var/run/dbg-cgi /opt/rootfs/var/run/dbus /opt/rootfs/var/lib/dbus /opt/rootfs/run/dbus /opt/rootfs/etc/actionengine
+          sudo mkdir -p /opt/rootfs/var/run/dbg-cgi /opt/rootfs/var/run/dbus /opt/rootfs/var/lib/dbus /opt/rootfs/run/dbus /opt/rootfs/etc/actionengine/system/1/actiontemplates /opt/rootfs/etc/actionengine/user/1/actiontemplates
           sudo chmod 1777 /opt/rootfs/tmp
           sudo mknod /opt/rootfs/dev/null c 1 3 2>/dev/null || true
           sudo chmod 666 /opt/rootfs/dev/null 2>/dev/null || true
@@ -161,7 +161,7 @@ jobs:
                 <exec_command>
                   <path>/bin/sh</path>
                   <exec_argument>-c</exec_argument>
-                  <exec_argument>id > /tmp/proof_ae 2>&1</exec_argument>
+                  <exec_argument>id &gt; /tmp/proof_ae 2&gt;&amp;1</exec_argument>
                 </exec_command>
               </start_command>
             </commands>
