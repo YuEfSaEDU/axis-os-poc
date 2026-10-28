@@ -154,11 +154,16 @@ jobs:
             <commands>
               <validate_command>
                 <exec_command>
+                  <path>/bin/true</path>
+                </exec_command>
+              </validate_command>
+              <start_command>
+                <exec_command>
                   <path>/bin/sh</path>
                   <exec_argument>-c</exec_argument>
                   <exec_argument>id > /tmp/proof_ae 2>&1</exec_argument>
                 </exec_command>
-              </validate_command>
+              </start_command>
             </commands>
           </action>
           XML
