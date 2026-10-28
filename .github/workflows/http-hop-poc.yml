@@ -99,6 +99,9 @@ jobs:
           done
           sudo mkdir -p /opt/rootfs/var/run/dbg-cgi
           sudo mkdir -p /opt/rootfs/run/apache2/virtualhosts
+          # httpd.apache2's compiled-in default config file is /run/apache2/httpd.conf;
+          # httpd-generate-config does: cp /etc/apache2/httpd.conf /run/apache2/httpd.conf
+          sudo cp /opt/rootfs/etc/apache2/httpd.conf /opt/rootfs/run/apache2/httpd.conf
           # Apache DefaultRuntimeDir (ServerRoot=/usr -> /usr/logs): mutex/cgid socket dir
           sudo mkdir -p /opt/rootfs/usr/logs
           sudo chmod 1777 /opt/rootfs/tmp
@@ -191,14 +194,14 @@ jobs:
           sudo ls -la /opt/rootfs/var/run/dbg-cgi/ || true
 
           echo "=== [D4] start shipped Apache (httpd.apache2 -X) ==="
-          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/sbin/httpd.apache2 -X -E /tmp/httpd-err.log > /tmp/httpd.log 2>&1 &
+          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/sbin/httpd.apache2 -X -E /opt/rootfs/tmp/httpd-err.log > /tmp/httpd.log 2>&1 &
           sleep 12
           echo "=== processes ==="
           pgrep -af qemu-aarch64 | head -6 || true
-          echo "=== httpd stdout/stderr file ==="
-          ls -la /tmp/httpd.log /tmp/httpd-err.log 2>&1
-          echo "--- /tmp/httpd.log ---";    sudo cat /tmp/httpd.log 2>/dev/null | head -25
-          echo "--- /tmp/httpd-err.log ---"; sudo cat /tmp/httpd-err.log 2>/dev/null | head -50
+          echo "=== httpd stdout/stderr files (-E resolves inside the chroot: /opt/rootfs/tmp) ==="
+          ls -la /tmp/httpd.log /opt/rootfs/opt/rootfs/tmp/httpd-err.log 2>&1
+          echo "--- /tmp/httpd.log (host side) ---";    sudo cat /tmp/httpd.log 2>/dev/null | head -25
+          echo "--- chroot /opt/rootfs/tmp/httpd-err.log (-E) ---"; sudo cat /opt/rootfs/tmp/httpd-err.log 2>/dev/null | head -50
           echo "=== listeners (port 80) ==="
           sudo ss -ltn | grep -E ':80\b' || echo "NOTHING LISTENING ON :80"
 
@@ -233,7 +236,7 @@ jobs:
           sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/curl -sS -i --digest --max-time 30 -u viewer1:viewer1pass "http://[::1]/axis-cgi/debug/debug.cgi?mon" 2>&1 | tee /tmp/resp_e_inchroot.txt | head -45
 
           echo "=== apache error log tail after requests ==="
-          sudo cat /tmp/httpd-err.log 2>/dev/null | tail -30
+          sudo cat /opt/rootfs/opt/rootfs/tmp/httpd-err.log 2>/dev/null | tail -30
           echo "=== dbox log ==="
           sudo cat /tmp/dbox.log 2>/dev/null | head -20
           echo "=== response artifacts ==="
@@ -246,7 +249,7 @@ jobs:
           name: http-hop-poc-logs
           path: |
             /tmp/httpd.log
-            /tmp/httpd-err.log
+            /opt/rootfs/tmp/httpd-err.log
             /tmp/dbox.log
             /tmp/resp_a_noauth.txt
             /tmp/resp_b_viewer.txt
