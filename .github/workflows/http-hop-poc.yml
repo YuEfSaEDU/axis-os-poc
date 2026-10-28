@@ -29,7 +29,7 @@ jobs:
       - name: Install tooling
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq qemu-user-static zstd python3-pip gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+          sudo apt-get install -y -qq qemu-user-static zstd python3-pip gcc-aarch64-linux-gnu libc6-dev-arm64-cross strace
           python3 -m pip install --quiet PySquashfsImage zstandard
 
       - name: Download and verify official firmware
@@ -195,31 +195,44 @@ jobs:
           sleep 6
           sudo ls -la /opt/rootfs/var/run/dbg-cgi/ || true
 
-          echo "=== [D4] start shipped Apache (httpd.apache2 -X) under qemu -strace (server keeps running attached to trace) ==="
-          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static -strace /usr/sbin/httpd.apache2 -X -E /tmp/httpd-err.log > /tmp/httpd.log 2> /tmp/httpd-strace.log &
-          sleep 14
+          echo "=== [D4] start shipped Apache (httpd.apache2 -X, stderr host-side, no -E) ==="
+          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/sbin/httpd.apache2 -X > /tmp/httpd.log 2>&1 &
+          UP=""
+          for i in $(seq 1 14); do
+            sleep 3
+            L=$(sudo ss -ltn | grep -E ':80\b' || true)
+            echo "poll $i: procs=$(pgrep -c -f 'qemu-aarch64.*httpd' || echo 0) listener=${L:-none}"
+            if [ -n "$L" ]; then UP=1; echo ">>> LISTENER UP at poll $i"; break; fi
+          done
           echo "=== processes ==="
           pgrep -af qemu-aarch64 | head -6 || true
-          echo "=== httpd stdout/stderr files (-E resolves inside the chroot: /opt/rootfs/tmp) ==="
-          ls -la /tmp/httpd.log /opt/rootfs/tmp/httpd-err.log /tmp/httpd-strace.log 2>&1
-          echo "--- /tmp/httpd.log (host side) ---";    sudo cat /tmp/httpd.log 2>/dev/null | head -25
-          echo "--- chroot /tmp/httpd-err.log (-E) ---"; sudo cat /opt/rootfs/tmp/httpd-err.log 2>/dev/null | head -50
-          echo "=== listeners (port 80) ==="
-          sudo ss -ltn | grep -E ':80\b' || echo "NOTHING LISTENING ON :80"
+          echo "=== /tmp/httpd.log (guest stderr, host side, verbatim) ==="
+          cat /tmp/httpd.log 2>/dev/null | head -40
+          if [ -z "$UP" ]; then
+            echo "=== [T1] FOREGROUND probe: httpd -X, no -E (stderr = console; exit code) ==="
+            timeout 20 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/sbin/httpd.apache2 -X
+            echo "T1 EXIT=$? (124 = ran until timeout = server works; else silent early death)"
 
-          if ! sudo ss -ltn | grep -qE ':80\b'; then
-            echo "=== [T1] FOREGROUND timeout probe of -X (get exit code + full stderr) ==="
-            timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/sbin/httpd.apache2 -X
-            echo "T1 EXIT=$? (124 = ran until timeout = actually works; 139 = SIGSEGV)"
-            sudo ls -la /proc/$(pgrep -of qemu-aarch64 >/dev/null && echo x) >/dev/null 2>&1 || true
-            echo "=== [T2] shipped start form: httpd -k start -DNO_DETACH in background ==="
-            sudo rm -f /opt/rootfs/usr/logs/httpd.pid
-            sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/sbin/httpd.apache2 -k start -DNO_DETACH > /tmp/httpd2.log 2>&1 &
-            sleep 15
-            pgrep -af "qemu-aarch64.*httpd" | head -4 || echo "no httpd process"
-            sudo ss -ltn | grep -E ':80\b' || echo "NOTHING LISTENING ON :80 (after -k start)"
-            echo "--- /tmp/httpd2.log ---"; sudo cat /tmp/httpd2.log 2>/dev/null | head -25
-            echo "--- chroot /tmp/httpd-err.log (-E, shared) ---"; sudo cat /opt/rootfs/tmp/httpd-err.log 2>/dev/null | head -40
+            echo "=== [T3] HOST-SIDE strace -f of httpd -X under qemu (listener polled every 3s) ==="
+            sudo strace -f -qq -s 120 -o /tmp/host-strace.log chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/sbin/httpd.apache2 -X > /tmp/httpd-t3.log 2>&1 &
+            T3PID=$!
+            for i in $(seq 1 12); do
+              sleep 3
+              L=$(sudo ss -ltn | grep -E ':80\b' || true)
+              P=$(pgrep -c -f "qemu-aarch64.*httpd" || true)
+              echo "poll $i: httpd_procs=$P listener=${L:-none}"
+              if [ -n "$L" ]; then echo ">>> LISTENER UP at poll $i"; break; fi
+            done
+            sudo pkill -f "qemu-aarch64-static /usr/sbin/httpd.apache2" 2>/dev/null; sleep 1
+            kill $T3PID 2>/dev/null
+            echo "=== host strace: signals + process exits ==="
+            grep -E "SIG(SEGV|ILL|BUS|ABRT|TERM)|exited with|+++ killed" /tmp/host-strace.log | head -20
+            echo "=== host strace: guest-relevant syscalls (setuid/initgroups/clone/fork/exit_group) tail ==="
+            grep -E "setuid|setgid|setgroups|initgroups|clone|fork|exit_group|rt_sigaction\(SIG" /tmp/host-strace.log | tail -40
+            echo "=== host strace raw tail ==="
+            sudo tail -30 /tmp/host-strace.log
+            echo "--- T3 console (guest stderr) ---"
+            cat /tmp/httpd-t3.log | head -20
           fi
 
           echo "=== (a) NO-AUTH viewer route: GET debug.cgi?mon (expect 401 digest challenge) ==="
@@ -249,8 +262,8 @@ jobs:
 
           echo "=== apache error log tail after requests ==="
           sudo cat /opt/rootfs/tmp/httpd-err.log 2>/dev/null | tail -30
-          echo "=== qemu -strace tail after requests ==="
-          sudo tail -40 /tmp/httpd-strace.log 2>/dev/null
+          echo "=== host strace tail after requests (if T3 ran) ==="
+          grep -E "SIG(SEGV|ILL|BUS|ABRT|TERM)|exited with|+++ killed" /tmp/host-strace.log 2>/dev/null | head -10
           echo "=== dbox log ==="
           sudo cat /tmp/dbox.log 2>/dev/null | head -20
           echo "=== response artifacts ==="
@@ -263,8 +276,8 @@ jobs:
           name: http-hop-poc-logs
           path: |
             /tmp/httpd.log
-            /tmp/httpd-strace.log
-            /opt/rootfs/tmp/httpd-err.log
+            /tmp/httpd-t3.log
+            /tmp/host-strace.log
             /tmp/dbox.log
             /tmp/resp_a_noauth.txt
             /tmp/resp_b_viewer.txt
