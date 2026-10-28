@@ -131,6 +131,8 @@ jobs:
           Define MAX_SPARE_THREADS 4
           Define RTSP_TIMEOUT 180
           Define APACHE_DIGEST_NONCE_LIFETIME 300
+          Define HTTP2_ENABLED
+          Define H2 h2
           EOF
 
           # ---- /run/apache2/virtualhosts/vhosts.conf ----
@@ -193,21 +195,21 @@ jobs:
           sleep 6
           sudo ls -la /opt/rootfs/var/run/dbg-cgi/ || true
 
-          echo "=== [D4] start shipped Apache (httpd.apache2 -X) ==="
-          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/sbin/httpd.apache2 -X -E /opt/rootfs/tmp/httpd-err.log > /tmp/httpd.log 2>&1 &
-          sleep 12
+          echo "=== [D4] start shipped Apache (httpd.apache2 -X) under qemu -strace (server keeps running attached to trace) ==="
+          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static -strace /usr/sbin/httpd.apache2 -X -E /tmp/httpd-err.log > /tmp/httpd.log 2> /tmp/httpd-strace.log &
+          sleep 14
           echo "=== processes ==="
           pgrep -af qemu-aarch64 | head -6 || true
           echo "=== httpd stdout/stderr files (-E resolves inside the chroot: /opt/rootfs/tmp) ==="
-          ls -la /tmp/httpd.log /opt/rootfs/opt/rootfs/tmp/httpd-err.log 2>&1
+          ls -la /tmp/httpd.log /opt/rootfs/tmp/httpd-err.log /tmp/httpd-strace.log 2>&1
           echo "--- /tmp/httpd.log (host side) ---";    sudo cat /tmp/httpd.log 2>/dev/null | head -25
-          echo "--- chroot /opt/rootfs/tmp/httpd-err.log (-E) ---"; sudo cat /opt/rootfs/tmp/httpd-err.log 2>/dev/null | head -50
+          echo "--- chroot /tmp/httpd-err.log (-E) ---"; sudo cat /opt/rootfs/tmp/httpd-err.log 2>/dev/null | head -50
           echo "=== listeners (port 80) ==="
           sudo ss -ltn | grep -E ':80\b' || echo "NOTHING LISTENING ON :80"
 
           if ! sudo ss -ltn | grep -qE ':80\b'; then
-            echo "=== [D5] apache not up: qemu -strace of config test (first 160 syscalls) ==="
-            sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static -strace /usr/sbin/httpd.apache2 -t 2>&1 | tail -120
+            echo "=== [D6] apache not up: tail of qemu -strace of the -X run ==="
+            sudo tail -100 /tmp/httpd-strace.log 2>/dev/null
           fi
 
           echo "=== (a) NO-AUTH viewer route: GET debug.cgi?mon (expect 401 digest challenge) ==="
@@ -236,7 +238,9 @@ jobs:
           sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/curl -sS -i --digest --max-time 30 -u viewer1:viewer1pass "http://[::1]/axis-cgi/debug/debug.cgi?mon" 2>&1 | tee /tmp/resp_e_inchroot.txt | head -45
 
           echo "=== apache error log tail after requests ==="
-          sudo cat /opt/rootfs/opt/rootfs/tmp/httpd-err.log 2>/dev/null | tail -30
+          sudo cat /opt/rootfs/tmp/httpd-err.log 2>/dev/null | tail -30
+          echo "=== qemu -strace tail after requests ==="
+          sudo tail -40 /tmp/httpd-strace.log 2>/dev/null
           echo "=== dbox log ==="
           sudo cat /tmp/dbox.log 2>/dev/null | head -20
           echo "=== response artifacts ==="
@@ -249,6 +253,7 @@ jobs:
           name: http-hop-poc-logs
           path: |
             /tmp/httpd.log
+            /tmp/httpd-strace.log
             /opt/rootfs/tmp/httpd-err.log
             /tmp/dbox.log
             /tmp/resp_a_noauth.txt
