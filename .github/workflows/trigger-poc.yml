@@ -238,8 +238,13 @@ jobs:
             echo "--- variant $VAR ($XF, conditions-only) ---"
             echo "DEBUG: CNT=$CNT BYTES_tokens=$(echo $BYTES | wc -w) SE_ARGS_tokens=$(echo $SE_ARGS | wc -w)"
             echo "DEBUG: first5=[$(echo $SE_ARGS | cut -d' ' -f1-5 | head -c 60)] last5=[$(echo $SE_ARGS | tr ' ' '\n' | tail -5 | tr '\n' ',')]"
-            timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /tmp/bcwrap.sh call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule Add sbayayuuuii "poc_rule_$VAR" true $SE_ARGS 2>&1 | tee /tmp/ruleadd_$VAR.log | head -6
+            timeout 40 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /tmp/bcwrap.sh call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule Add sbayayuuuii "poc_rule_$VAR" true $SE_ARGS > /tmp/ruleadd_$VAR.log 2>&1
             echo "ruleAdd variant $VAR exit: $?"
+            cat /tmp/ruleadd_$VAR.log
+            echo "--- engine alive after $VAR? ---"
+            pgrep -f "actionengined -ni" > /dev/null && echo "engine ALIVE" || echo "engine DEAD"
+            echo "--- rules on disk: ---"
+            sudo ls /opt/rootfs/etc/actionengine/system/1/rules/ 2>/dev/null | tail -4
             if grep -qE '^(s|i|u|o|b) ' /tmp/ruleadd_$VAR.log; then echo "RULE ADDED (variant $VAR)"; break; fi
           done
           if ! pgrep -f "actionengined -ni" > /dev/null; then eval "$AE_START"; sleep 8; fi
@@ -261,6 +266,15 @@ jobs:
       - name: FIRE the bound event (Activate + send_event backup) as uid 150 and check root-exec proof
         run: |
           set +e
+          echo "=== pre-fire: clean engine restart (loads persisted dynamic rules) ==="
+          sudo pkill -f "actionengined -ni" 2>/dev/null; sleep 2
+          eval "sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/actionengined -ni actionengined.system -c /usr/share/actionengine/action_engine_system.conf > /tmp/ae2.log 2>&1 &"
+          sleep 8
+          sudo tail -6 /tmp/ae2.log 2>/dev/null
+          echo "=== pre-fire: ActionRule.List after restart ==="
+          timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule List > /tmp/rulelist0.log 2>&1
+          head -c 600 /tmp/rulelist0.log
+          echo ""
           echo "=== pre-flight: bus names owned (verbatim) ==="
           timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl list --no-pager --no-legend 2>&1 | tee /tmp/busnames.log | grep -E "^com\.axis" | grep -v activatable | head -10
           echo "=== pre-flight: current ActionRule.List ==="
