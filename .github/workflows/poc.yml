@@ -77,18 +77,19 @@ jobs:
                       try: walk(ch, path)
                       except Exception as e: print('walk fail', path, e)
                   return
+              if node.is_symlink:
+                  target = node.readlink()
+                  if isinstance(target, bytes): target = target.decode('utf-8','replace')
+                  try:
+                      if os.path.lexists(path): os.remove(path)
+                      os.symlink(target, path)
+                  except (OSError, ValueError):
+                      open(path + '.symlink','w').write(target)
+                  return
               try:
                   data = img.read_file(node.inode)
               except Exception as e:
                   print('read fail', path, e); return
-              if node.is_symlink:
-                  target = (data or b'').decode('utf-8','replace')
-                  try:
-                      if os.path.lexists(path): os.remove(path)
-                      os.symlink(target, path)
-                  except OSError:
-                      open(path + '.symlink','w').write(target)
-                  return
               if data is None:
                   open(path + '.unreadable','wb').close(); return
               open(path,'wb').write(data)
