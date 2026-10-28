@@ -91,7 +91,7 @@ jobs:
             if [ -L "/opt/rootfs/$p" ]; then sudo rm -f "/opt/rootfs/$p"; fi
             sudo mkdir -p "/opt/rootfs/$p"
           done
-          sudo mkdir -p /opt/rootfs/var/run/dbg-cgi /opt/rootfs/var/run/dbus /opt/rootfs/var/lib/dbus
+          sudo mkdir -p /opt/rootfs/var/run/dbg-cgi /opt/rootfs/var/run/dbus /opt/rootfs/var/lib/dbus /opt/rootfs/run/dbus /opt/rootfs/etc/actionengine
           sudo chmod 1777 /opt/rootfs/tmp
           sudo mknod /opt/rootfs/dev/null c 1 3 2>/dev/null || true
           sudo chmod 666 /opt/rootfs/dev/null 2>/dev/null || true
@@ -127,13 +127,13 @@ jobs:
           set +e
           echo "=== start dbus-daemon --system inside chroot ==="
           sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/dbus-uuidgen --ensure 2>&1 | head -2
-          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/dbus-daemon --system --nofork --nopidfile --address=unix:path=/var/run/dbus/system_bus_socket > /tmp/dbus.log 2>&1 &
+          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/dbus-daemon --system --nofork --nopidfile --address=unix:path=/run/dbus/system_bus_socket > /tmp/dbus.log 2>&1 &
           sleep 5
           sudo ls -la /opt/rootfs/var/run/dbus/ || true
           echo "=== busctl (sanity: bus reachable) ==="
           timeout 20 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl --no-pager list 2>&1 | head -10
           echo "=== start actionengined ==="
-          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/actionengined > /tmp/ae.log 2>&1 &
+          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/actionengined -ni actionengined.system -c /usr/share/actionengine/action_engine_system.conf > /tmp/ae.log 2>&1 &
           sleep 8
           echo "=== actionengined log (verbatim) ==="
           sudo cat /tmp/ae.log | head -20
