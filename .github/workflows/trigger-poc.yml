@@ -203,13 +203,16 @@ jobs:
           sudo tee /opt/rootfs/tmp/rule_W.xml > /dev/null <<'XML'
           <?xml version="1.0" encoding="UTF-8"?><StartEvent><wsnt:TopicExpression xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" xmlns:tns1="http://www.onvif.org/ver10/topics" xmlns:tnsaxis="http://www.axis.com/2009/event/topics" Dialect="http://docs.oasis-open.org/wsn/t-1/TopicExpression/Concrete">tns1:Device/tnsaxis:IO/tnsaxis:VirtualInput</wsnt:TopicExpression></StartEvent>
           XML
+          sudo rm -f /opt/rootfs/tmp/rule_P.xml /opt/rootfs/tmp/rule_W.xml
           if [ -z "${CONF_ID}" ]; then CONF_ID=12; fi
           AE_START="sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/actionengined -ni actionengined.system -c /usr/share/actionengine/action_engine_system.conf > /tmp/ae.log 2>&1 &"
-          for VAR in C P W; do
+          echo "=== P2a discriminator: nonempty SECOND array, count-first (stock grammar) ==="
+          if ! pgrep -f "actionengined -ni" > /dev/null; then eval "$AE_START"; sleep 8; fi
+          timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /tmp/bcwrap.sh call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule Add sbayayuuuii "p2a" true 0 2 97 98 0 0 0 0 12 0 2>&1 | head -3
+          for VAR in C2 C3 C1; do
             case $VAR in
-              C) XF=rule_C.xml; STARTBYTES="0";;
-              P) XF=rule_P.xml; STARTBYTES="";;
-              W) XF=rule_W.xml; STARTBYTES="";;
+              C) XF=rule_C.xml;;
+              C2|C3|C1) XF=rule_C.xml;;
             esac
             # restart engine if a previous variant crashed it
             if ! pgrep -f "actionengined -ni" > /dev/null; then
@@ -220,14 +223,19 @@ jobs:
             # busctl 'ay' consumes: <element count> <count x byte values>
             CNT=$(sudo od -An -tu1 -v /opt/rootfs/tmp/$XF | tr -s ' \n' ' ' | sed 's/^ //;s/ $//' | wc -w)
             BYTES=$(sudo od -An -tu1 -v /opt/rootfs/tmp/$XF | tr -s ' \n' ' ' | sed 's/^ //;s/ $//')
-            if [ "$VAR" = "C" ]; then
-              # start_event = empty ay, conditions = CNT BYTES, then 4 u + primary + fallback
-              SE_ARGS="0 $CNT $BYTES 0 0 0 0 ${CONF_ID} 0"
+            # observed: two EMPTY ays consume 9 params total -> vendor busctl counts one
+            # param less than stock for empty arrays. Try all three alignments:
+            if [ "$VAR" = "C2" ]; then
+              # drop FIRST empty-array count (empty ay costs 0)
+              SE_ARGS="$CNT $BYTES 0 0 0 0 ${CONF_ID} 0"
+            elif [ "$VAR" = "C3" ]; then
+              # drop LAST param (fallback i)
+              SE_ARGS="0 $CNT $BYTES 0 0 0 0 ${CONF_ID}"
             else
-              # start_event = CNT BYTES, conditions = empty ay, then 4 u + primary + fallback
-              SE_ARGS="$CNT $BYTES 0 0 0 0 0 ${CONF_ID} 0"
+              # C1: stock count-first grammar
+              SE_ARGS="0 $CNT $BYTES 0 0 0 0 ${CONF_ID} 0"
             fi
-            echo "--- variant $VAR ($XF; start_event=$([ "$VAR" = "C" ] && echo empty || echo "$XF") , conditions=$([ "$VAR" = "C" ] && echo "$XF" || echo empty)) ---"
+            echo "--- variant $VAR ($XF, conditions-only) ---"
             echo "DEBUG: CNT=$CNT BYTES_tokens=$(echo $BYTES | wc -w) SE_ARGS_tokens=$(echo $SE_ARGS | wc -w)"
             echo "DEBUG: first5=[$(echo $SE_ARGS | cut -d' ' -f1-5 | head -c 60)] last5=[$(echo $SE_ARGS | tr ' ' '\n' | tail -5 | tr '\n' ',')]"
             timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /tmp/bcwrap.sh call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule Add sbayayuuuii "poc_rule_$VAR" true $SE_ARGS 2>&1 | tee /tmp/ruleadd_$VAR.log | head -6
