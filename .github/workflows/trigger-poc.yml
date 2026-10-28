@@ -235,11 +235,14 @@ jobs:
             if grep -qE '^(s|i|u|o|b) ' /tmp/ruleadd_$VAR.log; then echo "RULE ADDED (variant $VAR)"; break; fi
           done
           if ! pgrep -f "actionengined -ni" > /dev/null; then eval "$AE_START"; sleep 8; fi
-          echo "=== T-LADDER: param-count bisect (expect flip between too-few and too-many at k=10) ==="
-          for K in 7 8 9 10; do
-            FILL=$(seq 1 $((K-2)) | sed 's/^/0 /')
-            echo "--- K=$K params: poc_ladder true $FILL ---"
-            timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /tmp/bcwrap.sh call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule Add sbayayuuuii "poc_ladder" true $FILL 2>&1 | head -3
+          echo "=== T0: scalar control Remove i 0 (expect ENGINE error, proves parse+send path) ==="
+          timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /tmp/bcwrap.sh call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule Remove i 0 2>&1 | head -3
+          echo "=== T-LADDER: param-count bisect k=6..10 (fill='0') ==="
+          for K in 6 7 8 9 10; do
+            FILL=""
+            for i in $(seq 3 $K); do FILL="$FILL 0"; done
+            echo "--- K=$K params ---"
+            timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /tmp/bcwrap.sh call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule Add sbayayuuuii "poc_ladder" true $FILL 2>&1 | grep -E "Too (many|few)|Call failed|i \"|s \"|^(s|i|u|b) " | head -2
           done
           echo "=== ActionRule.List (verbatim) ==="
           timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule List 2>&1 | tee /tmp/rulelist.log | head -c 1500
