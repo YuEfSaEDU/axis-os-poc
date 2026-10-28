@@ -216,12 +216,14 @@ jobs:
             CNT=$(sudo od -An -tu1 -v /opt/rootfs/tmp/$XF | tr -s ' \n' ' ' | sed 's/^ //;s/ $//' | wc -w)
             BYTES=$(sudo od -An -tu1 -v /opt/rootfs/tmp/$XF | tr -s ' \n' ' ' | sed 's/^ //;s/ $//')
             if [ "$VAR" = "C" ]; then
-              SE_ARGS="0 $CNT $BYTES"
+              # start_event = empty ay, conditions = CNT BYTES, then 4 u + primary + fallback
+              SE_ARGS="0 $CNT $BYTES 0 0 0 0 ${CONF_ID} -1"
             else
-              SE_ARGS="$CNT $BYTES 0"
+              # start_event = CNT BYTES, conditions = empty ay, then 4 u + primary + fallback
+              SE_ARGS="$CNT $BYTES 0 0 0 0 0 ${CONF_ID} -1"
             fi
             echo "--- variant $VAR ($XF; start_event=$([ "$VAR" = "C" ] && echo empty || echo "$XF") , conditions=$([ "$VAR" = "C" ] && echo "$XF" || echo empty)) ---"
-            timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /usr/bin/busctl call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule Add sbayayuuuii "poc_rule_$VAR" true $SE_ARGS 0 0 0 0 "${CONF_ID}" -1 2>&1 | tee /tmp/ruleadd_$VAR.log | head -6
+            timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /usr/bin/busctl call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule Add sbayayuuuii "poc_rule_$VAR" true $SE_ARGS 2>&1 | tee /tmp/ruleadd_$VAR.log | head -6
             echo "ruleAdd variant $VAR exit: $?"
             if grep -qE '^(s|i|u|o|b) ' /tmp/ruleadd_$VAR.log; then echo "RULE ADDED (variant $VAR)"; break; fi
           done
