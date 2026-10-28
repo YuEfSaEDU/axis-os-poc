@@ -93,6 +93,7 @@ jobs:
           done
           sudo mkdir -p /opt/rootfs/var/run/dbg-cgi /opt/rootfs/var/run/dbus /opt/rootfs/var/lib/dbus /opt/rootfs/run/dbus /opt/rootfs/etc/actionengine/system/1/actiontemplates /opt/rootfs/etc/actionengine/user/1/actiontemplates
           sudo chmod 1777 /opt/rootfs/tmp
+          sudo chmod -R 777 /opt/rootfs/etc/actionengine
           sudo mknod /opt/rootfs/dev/null c 1 3 2>/dev/null || true
           sudo chmod 666 /opt/rootfs/dev/null 2>/dev/null || true
           aarch64-linux-gnu-gcc -static -O2 -o /tmp/dbox_client targets/axis-os/poc-harness/dbox_client.c 2>/dev/null || \
