@@ -245,13 +245,26 @@ jobs:
             cat /tmp/httpd-t3.log | head -20
           fi
 
-          echo "=== (a) AUTH-GATE PROBE: no-auth GET on static route /axis-release/info.properties (expect 401 if digest gate attaches) ==="
+          echo "=== (a) VHOST SELECTION PROBE: httpd -S + curl matrix on static route ==="
           HOSTIP=$(hostname -I | awk '{print $1}')
           D="http://$HOSTIP/axis-cgi/debug/debug.cgi?mon"
           FW="http://$HOSTIP/axis-cgi/firmwaremanagement.cgi"
           DISKS="http://$HOSTIP/axis-cgi/disks/list.cgi"
-          curl -sS -i --max-time 20 "http://$HOSTIP/axis-release/info.properties" 2>&1 | tee /tmp/resp_a0_static.txt | head -15
-          sleep 3
+          echo "--- httpd -S (parsed vhost table; stderr) ---"
+          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/sbin/httpd.apache2 -S 2>&1 | head -25
+          echo "--- /usr/html/axis-release + html root (do probe targets exist?) ---"
+          sudo ls -la /opt/rootfs/usr/html/axis-release/ 2>/dev/null | head -5
+          sudo ls /opt/rootfs/usr/html/ | head -10
+          for TGT in "http://$HOSTIP/axis-release/info.properties" "http://[::1]/axis-release/info.properties" "http://127.0.0.1/axis-release/info.properties"; do
+            echo "--- no-auth GET $TGT ---"
+            curl -sS -i --max-time 10 "$TGT" 2>&1 | head -8
+          done
+          echo "--- viewer1 --digest on [::1] static ---"
+          curl -sS -i --digest --max-time 15 -u viewer1:viewer1pass "http://[::1]/axis-release/info.properties" 2>&1 | head -12
+          sleep 1
+          echo "--- viewer1 --digest on [::1] debug.cgi?mon (chain attempt over native v6) ---"
+          curl -sS -i --digest --max-time 90 -u viewer1:viewer1pass "http://[::1]/axis-cgi/debug/debug.cgi?mon" -o /tmp/resp_b_viewer.txt 2>&1
+          head -c 900 /tmp/resp_b_viewer.txt; echo; echo "--- bytes: $(wc -c < /tmp/resp_b_viewer.txt)"
 
           echo "=== (a) NO-AUTH viewer route: GET debug.cgi?mon (expect 401 digest challenge; 200+tar proves gate bypass) ==="
           curl -sS -i --max-time 60 "$D" -o /tmp/resp_a_noauth.txt 2>&1
