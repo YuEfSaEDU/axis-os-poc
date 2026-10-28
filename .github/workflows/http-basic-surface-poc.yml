@@ -1,0 +1,238 @@
+name: http-basic-surface-poc
+# HYP-AX-002 hardening: reproduce the STOCK external surface's auth behavior.
+# The stock device surface is default-https (active=1, auth_type=basic, secure=1);
+# the default-http/digest surface is INACTIVE (active=0) and is the cert-less
+# failsafe the earlier http-hop run exercised. This run attaches the shipped
+# httpd-basic-auth.conf (AuthType Basic, same bare `Require axis-group-file`) with
+# anonymous-viewer OFF (no "anonymous" entry in group_auth, matching stock
+# APACHE_ANON_VIEWER=password) and asks the decisive question: does the BASIC
+# surface CHALLENGE an unauthenticated request (401) — proving a viewer LOGIN is
+# required to reach /axis-cgi/debug/* — or does it grant anonymous like the digest
+# failsafe did? TLS is omitted (auth challenge behavior is transport-independent;
+# disclosed). Apache is the real shipped binary + shipped config; no security
+# directive is removed or weakened. authz LogLevel raised to debug to capture the
+# provider's grant/deny decision verbatim.
+on:
+  workflow_dispatch:
+    inputs:
+      firmware_url:
+        description: "Official ftp.axis.com .bin URL"
+        required: true
+      firmware_sha256:
+        description: "Expected SHA256 of the .bin"
+        required: true
+
+jobs:
+  poc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-user-static zstd python3-pip gcc-aarch64-linux-gnu libc6-dev-arm64-cross strace apache2-utils
+          python3 -m pip install --quiet PySquashfsImage zstandard
+
+      - name: Download and verify official firmware
+        run: |
+          cd /tmp
+          curl -sS -o fw.bin "${{ github.event.inputs.firmware_url }}"
+          echo "${{ github.event.inputs.firmware_sha256 }}  fw.bin" | sha256sum -c -
+
+      - name: Unpack container + extract rootfs (real symlinks)
+        run: |
+          cd /tmp
+          python3 - <<'EOF'
+          import gzip, tarfile, os, sys
+          magic = open('fw.bin','rb').read(4)
+          if magic[:2] == b'\x1f\x8b':
+              raw = gzip.open('fw.bin','rb').read()
+          elif magic == b'\x28\xb5\x2f\xfd':
+              import zstandard
+              raw = zstandard.ZstdDecompressor().stream_reader(open('fw.bin','rb')).read()
+          else:
+              sys.exit('unknown container magic %r' % magic)
+          open('fw.tar','wb').write(raw)
+          tf = tarfile.open('fw.tar'); tf.extractall('pkg')
+          from PySquashfsImage import SquashFsImage
+          img = SquashFsImage(open('pkg/rootfs.img','rb'))
+          def sanitize(n):
+              for c in '\\/:*?"<>|': n = n.replace(c,'_')
+              return n
+          def walk(node, outdir):
+              name = node.name
+              if isinstance(name, bytes): name = name.decode('utf-8','replace')
+              path = os.path.join(outdir, sanitize(name))
+              if node.is_dir:
+                  os.makedirs(path, exist_ok=True)
+                  for ch in node.iterdir():
+                      try: walk(ch, path)
+                      except Exception as e: print('walk fail', path, e)
+                  return
+              if node.is_symlink:
+                  t = node.readlink()
+                  if isinstance(t, bytes): t = t.decode('utf-8','replace')
+                  try:
+                      if os.path.lexists(path): os.remove(path)
+                      os.symlink(t, path)
+                  except (OSError, ValueError):
+                      open(path + '.symlink','w').write(t)
+                  return
+              try: data = img.read_file(node.inode)
+              except Exception as e:
+                  print('read fail', path, e); return
+              if data is None: return
+              open(path,'wb').write(data)
+              try: os.chmod(path, node.mode & 0o777)
+              except OSError: pass
+          os.makedirs('rootfs', exist_ok=True)
+          for ch in img.root.iterdir(): walk(ch, 'rootfs')
+          print('rootfs extracted')
+          EOF
+          sudo mv /tmp/rootfs /opt/rootfs
+
+      - name: Provision chroot + BASIC-auth external surface (stock default-https auth_type)
+        run: |
+          for p in var/run var/tmp var/volatile tmp run; do
+            if [ -L "/opt/rootfs/$p" ]; then sudo rm -f "/opt/rootfs/$p"; fi
+            sudo mkdir -p "/opt/rootfs/$p"
+          done
+          sudo mkdir -p /opt/rootfs/var/run/dbg-cgi
+          sudo mkdir -p /opt/rootfs/run/apache2/virtualhosts
+          sudo cp /opt/rootfs/etc/apache2/httpd.conf /opt/rootfs/run/apache2/httpd.conf
+          sudo mkdir -p /opt/rootfs/usr/logs
+          sudo chmod 1777 /opt/rootfs/tmp
+          sudo mknod /opt/rootfs/dev/null c 1 3 2>/dev/null || true
+          sudo mknod /opt/rootfs/dev/urandom c 1 9 2>/dev/null || true
+          sudo mknod /opt/rootfs/dev/random c 1 8 2>/dev/null || true
+          sudo mknod /opt/rootfs/dev/zero c 1 5 2>/dev/null || true
+          sudo mknod /opt/rootfs/dev/console c 5 1 2>/dev/null || true
+          sudo chmod 666 /opt/rootfs/dev/null /opt/rootfs/dev/urandom /opt/rootfs/dev/random /opt/rootfs/dev/zero 2>/dev/null || true
+          sudo mkdir -p /opt/rootfs/dev/shm
+          sudo chmod 1777 /opt/rootfs/dev/shm
+          sudo mkdir -p /opt/rootfs/usr/logs/proxy
+
+          sudo tee /opt/rootfs/run/apache2/parameters.conf > /dev/null <<'EOF'
+          Define APACHE_PORT 80
+          Define HTTPS_PORT 443
+          Define AXIS_REALM AXIS_0012345678
+          Define AXIS_WS_REALM AXIS_WS_0012345678
+          Define APACHE_KEEPALIVETIMEOUT_S 180
+          Define APACHE_ACCESSLOG Off
+          Define APACHE_PAGECOUNTTHROTTLE 5
+          Define APACHE_SITECOUNTTHROTTLE 5
+          Define APACHE_PAGEINTERVALTHROTTLE 30
+          Define APACHE_SITEINTERVALTHROTTLE 30
+          Define APACHE_BLOCKINGPERIODTHROTTLE 30
+          Define MAX_WORKERS 35
+          Define MIN_SPARE_THREADS 20
+          Define MAX_SPARE_THREADS 55
+          Define RTSP_TIMEOUT 180
+          Define APACHE_DIGEST_NONCE_LIFETIME 5
+          Define HTTP2_ENABLED
+          Define H2 h2
+          EOF
+
+          # External vhost attaches httpd-basic-auth.conf (AuthType Basic) — the STOCK
+          # default-https auth_type. TLS omitted (auth challenge is transport-independent).
+          sudo tee /opt/rootfs/run/apache2/virtualhosts/vhosts.conf > /dev/null <<'EOF'
+          <VirtualHost [::]:80>
+            IncludeOptional /etc/apache2/conf.d/vhosts/external/*.conf
+            ServerName default
+            Include /etc/apache2/httpd-basic-auth.conf
+            IncludeOptional /etc/apache2/conf.d/vhosts/all/*.conf
+            IncludeOptional /etc/apache2/conf.d/vhosts/http/*.conf
+            Include /etc/apache2/httpd-auth-preview-mode.conf
+            IncludeOptional /run/apache2/customheaders.conf
+          </VirtualHost>
+          Listen 80
+          EOF
+
+          # BASIC auth user file (htpasswd/apr1) — AuthUserFile in httpd-basic.conf.
+          # viewer1 = viewer tier, admin1 = admin tier. NO "anonymous" entry anywhere
+          # (stock APACHE_ANON_VIEWER=password -> anonymous viewer OFF).
+          VP=$(htpasswd -nbm viewer1 viewer1pass | cut -d: -f2)
+          AP=$(htpasswd -nbm admin1 admin1pass | cut -d: -f2)
+          printf 'viewer1:%s\nadmin1:%s\n' "$VP" "$AP" | sudo tee /opt/rootfs/etc/apache2/basic_auth_passwd > /dev/null
+          sudo tee /opt/rootfs/etc/apache2/group_auth > /dev/null <<'EOF'
+          admin: admin1
+          operator:
+          viewer: viewer1
+          ptz:
+          EOF
+          sudo chmod 644 /opt/rootfs/etc/apache2/basic_auth_passwd /opt/rootfs/etc/apache2/group_auth
+
+          sudo cp /usr/bin/qemu-aarch64-static /opt/rootfs/usr/bin/
+          echo "=== basic_auth_passwd ==="; sudo cat /opt/rootfs/etc/apache2/basic_auth_passwd
+          echo "=== group_auth ==="; sudo cat /opt/rootfs/etc/apache2/group_auth
+
+      - name: dbox + Apache(basic) + probes (no-cred / viewer / wrong-pass / admin)
+        id: chain
+        continue-on-error: true
+        run: |
+          set +e
+          echo "=== config test ==="
+          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/sbin/httpd.apache2 -t 2>&1
+          echo "=== start dbox ==="
+          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/sbin/debugar.cgi -n > /tmp/dbox.log 2>&1 &
+          sleep 6
+          sudo ls -la /opt/rootfs/var/run/dbg-cgi/ || true
+
+          echo "=== start shipped Apache, authz LogLevel=debug (capture grant/deny decision) ==="
+          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/sbin/httpd.apache2 -X \
+            -c "ErrorLog /tmp/httpd-err2.log" \
+            -c "LogLevel authz_axisgroupfile:debug authz_core:debug auth_basic:debug" > /tmp/httpd.log 2>&1 &
+          UP=""
+          for i in $(seq 1 14); do
+            sleep 3
+            L=$(sudo ss -ltn | grep -E ':80\b' || true)
+            echo "poll $i: procs=$(pgrep -c -f 'qemu-aarch64.*httpd' || echo 0) listener=${L:-none}"
+            if [ -n "$L" ]; then UP=1; echo ">>> LISTENER UP at poll $i"; break; fi
+          done
+          cat /tmp/httpd.log 2>/dev/null | head -40
+
+          HOSTIP=$(hostname -I | awk '{print $1}')
+          B="http://$HOSTIP"
+
+          echo "=== (1) NO CREDENTIALS: GET debug.cgi?cmd=ps  [DECISIVE: expect 401 challenge on stock basic surface] ==="
+          curl -sS -i --max-time 90 "$B/axis-cgi/debug/debug.cgi?cmd=ps" -o /tmp/r1_nocred.txt 2>&1
+          head -c 900 /tmp/r1_nocred.txt; echo; echo "--- bytes: $(wc -c < /tmp/r1_nocred.txt)"
+          sleep 18
+
+          echo "=== (2) VIEWER basic: viewer1:viewer1pass GET debug.cgi?cmd=ps  [expect 200 + psdump] ==="
+          curl -sS -i --basic --max-time 90 -u viewer1:viewer1pass "$B/axis-cgi/debug/debug.cgi?cmd=ps" -o /tmp/r2_viewer.txt 2>&1
+          head -c 900 /tmp/r2_viewer.txt; echo; echo "--- bytes: $(wc -c < /tmp/r2_viewer.txt)"
+          sleep 18
+
+          echo "=== (3) WRONG PASSWORD: viewer1:WRONGPASS  [expect 401] ==="
+          curl -sS -i --basic --max-time 90 -u viewer1:WRONGPASS "$B/axis-cgi/debug/debug.cgi?cmd=ps" -o /tmp/r3_wrong.txt 2>&1
+          head -c 700 /tmp/r3_wrong.txt; echo; echo "--- bytes: $(wc -c < /tmp/r3_wrong.txt)"
+          sleep 18
+
+          echo "=== (4) ADMIN basic: admin1:admin1pass GET debug.cgi?cmd=ps  [expect 200 + psdump] ==="
+          curl -sS -i --basic --max-time 90 -u admin1:admin1pass "$B/axis-cgi/debug/debug.cgi?cmd=ps" -o /tmp/r4_admin.txt 2>&1
+          head -c 900 /tmp/r4_admin.txt; echo; echo "--- bytes: $(wc -c < /tmp/r4_admin.txt)"
+
+          echo "=== authz decision log (the grant/deny the provider actually made) ==="
+          sudo grep -E "AH01671|AH01626|AH01627|axisgroupfile|Require|anonymous|401|Basic realm" /opt/rootfs/tmp/httpd-err2.log 2>/dev/null | tail -60
+          echo "=== full error log tail ==="
+          sudo tail -50 /opt/rootfs/tmp/httpd-err2.log 2>/dev/null
+          echo "=== response artifact sizes ==="
+          wc -c /tmp/r*.txt 2>/dev/null
+
+      - name: Archive logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: http-basic-surface-logs
+          path: |
+            /tmp/httpd.log
+            /opt/rootfs/tmp/httpd-err2.log
+            /tmp/dbox.log
+            /tmp/r1_nocred.txt
+            /tmp/r2_viewer.txt
+            /tmp/r3_wrong.txt
+            /tmp/r4_admin.txt
+          if-no-files-found: ignore
