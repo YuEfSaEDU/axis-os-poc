@@ -104,8 +104,11 @@ jobs:
           sudo chmod 666 /opt/rootfs/dev/null 2>/dev/null || true
           aarch64-linux-gnu-gcc -static -O2 -o /tmp/runas targets/axis-os/poc-harness/runas.c 2>/dev/null || \
             aarch64-linux-gnu-gcc -static -O2 -o /tmp/runas runas.c
+          printf '#!/bin/sh\necho "BCWRAP argc=$# argv: $@" >> /tmp/bcwrap.log\nexec /usr/bin/busctl "$@"\n' > /tmp/bcwrap.sh
+          chmod 755 /tmp/bcwrap.sh
           file /tmp/runas
           sudo cp /tmp/runas /opt/rootfs/tmp/
+          sudo cp /tmp/bcwrap.sh /opt/rootfs/tmp/
           sudo cp /usr/bin/qemu-aarch64-static /opt/rootfs/usr/bin/
 
       - name: Bring up dbus, event_switch, virtualinputd, actionengined, geolocationd
@@ -219,22 +222,25 @@ jobs:
             BYTES=$(sudo od -An -tu1 -v /opt/rootfs/tmp/$XF | tr -s ' \n' ' ' | sed 's/^ //;s/ $//')
             if [ "$VAR" = "C" ]; then
               # start_event = empty ay, conditions = CNT BYTES, then 4 u + primary + fallback
-              SE_ARGS="0 $CNT $BYTES 0 0 0 0 ${CONF_ID} -1"
+              SE_ARGS="0 $CNT $BYTES 0 0 0 0 ${CONF_ID} 0"
             else
               # start_event = CNT BYTES, conditions = empty ay, then 4 u + primary + fallback
-              SE_ARGS="$CNT $BYTES 0 0 0 0 0 ${CONF_ID} -1"
+              SE_ARGS="$CNT $BYTES 0 0 0 0 0 ${CONF_ID} 0"
             fi
             echo "--- variant $VAR ($XF; start_event=$([ "$VAR" = "C" ] && echo empty || echo "$XF") , conditions=$([ "$VAR" = "C" ] && echo "$XF" || echo empty)) ---"
             echo "DEBUG: CNT=$CNT BYTES_tokens=$(echo $BYTES | wc -w) SE_ARGS_tokens=$(echo $SE_ARGS | wc -w)"
             echo "DEBUG: first5=[$(echo $SE_ARGS | cut -d' ' -f1-5 | head -c 60)] last5=[$(echo $SE_ARGS | tr ' ' '\n' | tail -5 | tr '\n' ',')]"
-            timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /usr/bin/busctl call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule Add sbayayuuuii "poc_rule_$VAR" true $SE_ARGS 2>&1 | tee /tmp/ruleadd_$VAR.log | head -6
+            timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /tmp/bcwrap.sh call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule Add sbayayuuuii "poc_rule_$VAR" true $SE_ARGS 2>&1 | tee /tmp/ruleadd_$VAR.log | head -6
             echo "ruleAdd variant $VAR exit: $?"
             if grep -qE '^(s|i|u|o|b) ' /tmp/ruleadd_$VAR.log; then echo "RULE ADDED (variant $VAR)"; break; fi
           done
-          echo "=== CONTROL: minimal rule add (empty start_event + empty conditions) expect engine error, NOT busctl arg error ==="
+          echo "=== T1: argv ground-truth dump (minimal call through wrapper) ==="
           if ! pgrep -f "actionengined -ni" > /dev/null; then eval "$AE_START"; sleep 8; fi
-          timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /usr/bin/busctl call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule Add sbayayuuuii "poc_rule_min" true 0 0 0 0 0 0 "${CONF_ID}" -1 2>&1 | tee /tmp/ruleadd_min.log | head -6
-          echo "control exit: $?"
+          timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /tmp/bcwrap.sh call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule Add sbayayuuuii "poc_rule_t1" true 0 0 0 0 0 0 12 -1 2>&1 | tee /tmp/t1.log | head -4
+          echo "=== T2: fallback=0, no dashdash ==="
+          timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /tmp/bcwrap.sh call --no-pager com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule Add sbayayuuuii "poc_rule_t2" true 0 0 0 0 0 0 12 0 2>&1 | tee /tmp/t2.log | head -4
+          echo "=== T3: fallback=0, with dashdash ==="
+          timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /tmp/runas 150 150 /tmp/bcwrap.sh call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule Add sbayayuuuii "poc_rule_t3" true 0 0 0 0 0 0 12 0 2>&1 | tee /tmp/t3.log | head -4
           echo "=== ActionRule.List (verbatim) ==="
           timeout 30 sudo chroot /opt/rootfs /usr/bin/qemu-aarch64-static /usr/bin/busctl call --no-pager -- com.axis.Event.ActionEngine.System /com/axis/Event/ActionEngine com.axis.Event.ActionEngine.ActionRule List 2>&1 | tee /tmp/rulelist.log | head -c 1500
           echo ""
