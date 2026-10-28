@@ -15,12 +15,14 @@ int main(int argc, char **argv) {
     gid_t gid = (gid_t)atoi(argv[2]);
     if (setresgid(gid, gid, gid) != 0) { perror("setresgid"); return 2; }
     if (setresuid(uid, uid, uid) != 0) { perror("setresuid"); return 2; }
-    /* qemu-user: re-invoke the emulator for the target binary we exec */
-    setenv("QEMU_EXECVE", "/usr/bin/qemu-aarch64-static", 1);
-    char **nargv = calloc((size_t)(argc + 2), sizeof(char *));
+    /* qemu-user: re-invoke the emulator for the target binary we exec.
+     * NOTE: the re-invoked qemu does NOT strip the binary path from argv, so the
+     * program path is passed twice (once as qemu's target, once as argv[0]). */
+    char **nargv = calloc((size_t)(argc + 3), sizeof(char *));
     nargv[0] = "/usr/bin/qemu-aarch64-static";
     nargv[1] = argv[3];
-    for (int i = 3; i < argc; i++) nargv[i - 1] = argv[i];
+    nargv[2] = argv[3];
+    for (int i = 3; i < argc; i++) nargv[i] = argv[i];
     fprintf(stderr, "RUNAS uid=%d gid=%d exec %s\n", getuid(), getgid(), argv[3]);
     execv("/usr/bin/qemu-aarch64-static", nargv);
     perror("execv");
